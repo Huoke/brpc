@@ -48,7 +48,7 @@ int AddChannel(brpc::ChannelBase* sub_channel,
 
 ## CallMapper
 
-用于把对ParallelChannel的调用转化为对sub channel的调用。如果call_mapper是NULL，sub channel的请求就是ParallelChannel的请求，而response则New()自ParallelChannel的response。如果call_mapper不为NULL，则会在ParallelChannel析构时被删除。call_mapper内含引用计数，一个call_mapper可与多个sub channel关联。
+用于把对ParallelChannel的调用转化为对sub channel的调用。如果call_mapper是nullptr，sub channel的请求就是ParallelChannel的请求，而response则New()自ParallelChannel的response。如果call_mapper不为nullptr，则会在ParallelChannel析构时被删除。call_mapper内含引用计数，一个call_mapper可与多个sub channel关联。
 
 ```c++
 class CallMapper {
@@ -60,8 +60,12 @@ public:
                         const google::protobuf::MethodDescriptor* method,
                         const google::protobuf::Message* request,
                         google::protobuf::Message* response) = 0;
+
+    virtual void MapController(int channel_index/*starting from 0*/, int channel_count,
+                               const Controller* main_cntl, Controller* sub_cntl);
 };
 ```
+### Map
 
 channel_index：该sub channel在ParallelChannel中的位置，从0开始计数。
 
@@ -76,7 +80,7 @@ method/request/response：ParallelChannel.CallMethod()的参数。
 
 常见的Map()实现有：
 
-- 广播request。这也是call_mapper为NULL时的行为：
+- 广播request。这也是call_mapper为nullptr时的行为：
 ```c++
   class Broadcaster : public CallMapper {
   public:
@@ -124,9 +128,21 @@ method/request/response：ParallelChannel.CallMethod()的参数。
   };
 ```
 
+### MapController
+
+channel_index：该sub channel在ParallelChannel中的位置，从0开始计数。
+
+channel_count：ParallelChannel中sub channel的数量。
+
+main_cntl：ParallelChannel.CallMethod()的参数。
+
+sub_cntl：sub channel的请求对应的controller。默认实现：拷贝main_cntl的http_request和request_attachment到sub_cntl中。
+
+注意：修改ClientSettings相关配置（如超时、重试等）是无效的，因为所有sub_cntl都是使用main_cntl的ClientSettings配置。
+
 ## ResponseMerger
 
-response_merger把sub channel的response合并入总的response，其为NULL时，则使用response->MergeFrom(*sub_response)，MergeFrom的行为可概括为“除了合并repeated字段，其余都是覆盖”。如果你需要更复杂的行为，则需实现ResponseMerger。response_merger是一个个执行的，所以你并不需要考虑多个Merge同时运行的情况。response_merger在ParallelChannel析构时被删除。response_merger内含引用计数，一个response_merger可与多个sub channel关联。
+response_merger把sub channel的response合并入总的response，其为nullptr时，则使用response->MergeFrom(*sub_response)，MergeFrom的行为可概括为“除了合并repeated字段，其余都是覆盖”。如果你需要更复杂的行为，则需实现ResponseMerger。response_merger是一个个执行的，所以你并不需要考虑多个Merge同时运行的情况。response_merger在ParallelChannel析构时被删除。response_merger内含引用计数，一个response_merger可与多个sub channel关联。
 
 Result的取值有：
 - MERGED: 成功合并。
@@ -141,13 +157,13 @@ Result的取值有：
 ```c++
 // Get the controllers for accessing sub channels in combo channels.
 // Ordinary channel:
-//   sub_count() is 0 and sub() is always NULL.
+//   sub_count() is 0 and sub() is always nullptr.
 // ParallelChannel/PartitionChannel:
 //   sub_count() is #sub-channels and sub(i) is the controller for
 //   accessing i-th sub channel inside ParallelChannel, if i is outside
-//    [0, sub_count() - 1], sub(i) is NULL.
-//   NOTE: You must test sub() against NULL, ALWAYS. Even if i is inside
-//   range, sub(i) can still be NULL:
+//    [0, sub_count() - 1], sub(i) is nullptr.
+//   NOTE: You must test sub() against nullptr, ALWAYS. Even if i is inside
+//   range, sub(i) can still be nullptr:
 //   * the rpc call may fail and terminate before accessing the sub channel
 //   * the sub channel was skipped
 // SelectiveChannel/DynamicPartitionChannel:
@@ -195,7 +211,7 @@ if (schan.Init(load_balancer, &schan_options) != 0) {
 初始化完毕后通过AddChannel加入sub channel。
 
 ```c++
-if (schan.AddChannel(sub_channel, NULL/*ChannelHandle*/) != 0) {  // 第二个参数ChannelHandle用于删除sub channel，不用删除可填NULL
+if (schan.AddChannel(sub_channel, nullptr/*ChannelHandle*/) != 0) {  // 第二个参数ChannelHandle用于删除sub channel，不用删除可填nullptr
     LOG(ERROR) << "Fail to add sub_channel";
     return -1;
 }
@@ -233,18 +249,18 @@ if (channel.Init("c_murmurhash", &schan_options) != 0) {
  
 for (int i = 0; i < 3; ++i) {
     brpc::Channel* sub_channel = new brpc::Channel;
-    if (sub_channel->Init(ns_node_name[i], "rr", NULL) != 0) {
+    if (sub_channel->Init(ns_node_name[i], "rr", nullptr) != 0) {
         LOG(ERROR) << "Fail to init sub channel " << i;
         return -1;
     }
-    if (channel.AddChannel(sub_channel, NULL/*handle for removal*/) != 0) {
+    if (channel.AddChannel(sub_channel, nullptr/*handle for removal*/) != 0) {
         LOG(ERROR) << "Fail to add sub_channel to channel";
         return -1;
     } 
 }
 ...
 XXXService_Stub stub(&channel);
-stub.FooMethod(&cntl, &request, &response, NULL);
+stub.FooMethod(&cntl, &request, &response, nullptr);
 ...
 ```
 
@@ -272,7 +288,7 @@ public:
             LOG(ERROR) << "Invalid tag=" << tag;
             return false;
         }
-        char* endptr = NULL;
+        char* endptr = nullptr;
         out->index = strtol(tag.c_str(), &endptr, 10);
         if (endptr != tag.data() + pos) {
             LOG(ERROR) << "Invalid index=" << butil::StringPiece(tag.data(), pos);

@@ -63,7 +63,7 @@ extern int bthread_timer_del(bthread_timer_t id);
 extern int bthread_fd_wait(int fd, unsigned events);
 
 // Suspend caller thread until the file descriptor `fd' has `epoll_events'
-// or CLOCK_REALTIME reached `abstime' if abstime is not NULL.
+// or CLOCK_REALTIME reached `abstime' if abstime is not nullptr.
 // Returns 0 on success, -1 otherwise and errno is set.
 extern int bthread_fd_timedwait(int fd, unsigned epoll_events,
                                 const struct timespec* abstime);
@@ -80,7 +80,7 @@ extern int bthread_close(int fd);
 extern int bthread_connect(int sockfd, const struct sockaddr* serv_addr,
                            socklen_t addrlen);
 // Suspend caller thread until connect(2) on `sockfd' succeeds
-// or CLOCK_REALTIME reached `abstime' if `abstime' is not NULL.
+// or CLOCK_REALTIME reached `abstime' if `abstime' is not nullptr.
 extern int bthread_timed_connect(int sockfd, const struct sockaddr* serv_addr,
                                  socklen_t addrlen, const timespec* abstime);
 
@@ -91,9 +91,6 @@ extern int bthread_set_worker_startfn(void (*start_fn)());
 
 // Add a startup function with tag
 extern int bthread_set_tagged_worker_startfn(void (*start_fn)(bthread_tag_t));
-
-// Add a create span function
-extern int bthread_set_create_span_func(void* (*func)());
 
 // Stop all bthread and worker pthreads.
 // You should avoid calling this function which may cause bthread after main()

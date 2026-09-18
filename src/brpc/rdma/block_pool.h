@@ -72,14 +72,21 @@ typedef uint32_t (*RegisterCallback)(void*, size_t);
 // The argument is a callback called when the pool is enlarged with a new
 // region. It should be the memory registration in brpc. However,
 // in block_pool, we just abstract it into a function to get region id.
-// Return the first region's address, NULL if failed and errno is set.
-void* InitBlockPool(RegisterCallback cb);
+// Return the first region's address, nullptr if failed and errno is set.
+bool InitBlockPool(RegisterCallback cb);
+
+// In scenarios where users need to manually specify memory regions (e.g., using
+// hugepages or custom memory pools), when
+// FLAGS_rdma_memory_pool_user_specified_memory is true, user is  responsibility
+// of extending memory blocks , this ensuring flexibility for advanced use
+// cases.
+void* ExtendBlockPoolByUser(void* region_base, size_t region_size, int block_type);
 
 // Allocate a buf with length at least @a size (require: size>0)
-// Return the address allocated, NULL if failed and errno is set.
+// Return the address allocated, nullptr if failed and errno is set.
 void* AllocBlock(size_t size);
 
-// Deallocate the buf (require: buf!=NULL)
+// Deallocate the buf (require: buf!=nullptr)
 // Return 0 if success, -1 if failed and errno is set.
 // If the given buf is not in any region, the errno is ERANGE.
 int DeallocBlock(void* buf);
@@ -88,10 +95,14 @@ int DeallocBlock(void* buf);
 uint32_t GetRegionId(const void* buf);
 
 // Return the block size of given block type
-// type=1: BLOCK_DEFAULT(8KB)
-// type=2: BLOCK_LARGE(64KB)
-// type=3: BLOCK_HUGE(2MB)
+// type=0: BLOCK_DEFAULT(8KB)
+// type=1: BLOCK_LARGE(64KB)
+// type=2: BLOCK_HUGE(2MB)
 size_t GetBlockSize(int type);
+
+size_t GetRdmaBlockSize();
+
+int GetRdmaBlockType();
 
 // Dump memory pool information
 void DumpMemoryPoolInfo(std::ostream& os);

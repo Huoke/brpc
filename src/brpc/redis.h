@@ -40,7 +40,7 @@ namespace brpc {
 //   RedisRequest request;
 //   request.AddCommand("PING");
 //   RedisResponse response;
-//   channel.CallMethod(&controller, &request, &response, NULL/*done*/);
+//   channel.CallMethod(&controller, &request, &response, nullptr/*done*/);
 //   if (!cntl.Failed()) {
 //       LOG(INFO) << response.reply(0);
 //   }
@@ -152,7 +152,7 @@ public:
         if (index < reply_size()) {
             return (index == 0 ? _first_reply : _other_replies[index - 1]);
         }
-        static RedisReply redis_nil(NULL);
+        static RedisReply redis_nil(nullptr);
         return redis_nil;
     }
 
@@ -217,10 +217,7 @@ class RedisCommandParser;
 // This class is as parsing_context in socket.
 class RedisConnContext : public Destroyable  {
 public:
-    explicit RedisConnContext(const RedisService* rs)
-        : redis_service(rs)
-        , batched_size(0)
-        , session(nullptr) {}
+    explicit RedisConnContext(const RedisService* rs);
 
     ~RedisConnContext();
     // @Destroyable

@@ -15,6 +15,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+print_info() {
+    printf "${CYAN}[INFO]${NC} %s\n" "$1"
+}
+print_success() {
+    printf "${GREEN}[OK]${NC}   %s\n" "$1"
+}
+print_step() {
+    printf "${BOLD}==> %s${NC}\n" "$1"
+}
+
 SYSTEM=$(uname -s)
 if [ "$SYSTEM" = "Darwin" ]; then
     if [ -z "$BASH" ] || [ "$BASH" = "/bin/sh" ] ; then
@@ -38,17 +54,22 @@ else
     LDD=ldd
 fi
 
-TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
+TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-urma,with-urma-mock,without-urma-mock,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,with-riscv-zvbc,with-riscv-zbc,with-cpu-frequency,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
 WITH_GLOG=0
 WITH_THRIFT=0
 WITH_RDMA=0
+WITH_URMA=0
+URMA_MOCK_MODE=auto
 WITH_MESALINK=0
 WITH_BTHREAD_TRACER=0
 WITH_ASAN=0
+WITH_RISCV_ZVBC=0
+WITH_RISCV_ZBC=0
 BRPC_DEBUG_BTHREAD_SCHE_SAFETY=0
 DEBUGSYMBOLS=-g
 WERROR=
 BRPC_DEBUG_LOCK=0
+WITH_CPU_FREQUENCY=0
 
 if [ $? != 0 ] ; then >&2 $ECHO "Terminating..."; exit 1 ; fi
 
@@ -71,17 +92,27 @@ while true; do
         --with-glog ) WITH_GLOG=1; shift 1 ;;
         --with-thrift) WITH_THRIFT=1; shift 1 ;;
         --with-rdma) WITH_RDMA=1; shift 1 ;;
+        --with-urma) WITH_URMA=1; shift 1 ;;
+        --with-urma-mock) URMA_MOCK_MODE=on; shift 1 ;;
+        --without-urma-mock) URMA_MOCK_MODE=off; shift 1 ;;
         --with-mesalink) WITH_MESALINK=1; shift 1 ;;
         --with-bthread-tracer) WITH_BTHREAD_TRACER=1; shift 1 ;;
         --with-debug-bthread-sche-safety ) BRPC_DEBUG_BTHREAD_SCHE_SAFETY=1; shift 1 ;;
         --with-debug-lock ) BRPC_DEBUG_LOCK=1; shift 1 ;;
+        --with-cpu-frequency ) WITH_CPU_FREQUENCY=1; shift 1 ;;
         --with-asan) WITH_ASAN=1; shift 1 ;;
+        --with-riscv-zvbc) WITH_RISCV_ZVBC=1; shift 1 ;;
+        --with-riscv-zbc) WITH_RISCV_ZBC=1; shift 1 ;;
         --nodebugsymbols ) DEBUGSYMBOLS=; shift 1 ;;
         --werror ) WERROR=-Werror; shift 1 ;;
         -- ) shift; break ;;
         * ) break ;;
     esac
 done
+
+print_step "Configuring brpc (${SYSTEM})"
+print_info "Headers path: ${HDRS_IN}"
+print_info "Libs path:    ${LIBS_IN}"
 
 if [ -z "$CC" ]; then
     if [ ! -z "$CXX" ]; then
@@ -99,9 +130,11 @@ elif [ -z "$CXX" ]; then
     exit 1
 fi
 
+print_info "CC=$CC, CXX=$CXX"
+
 GCC_VERSION=$(CXX=$CXX tools/print_gcc_version.sh)
-if [ $GCC_VERSION -gt 0 ] && [ $GCC_VERSION -lt 40800 ]; then
-    >&2 $ECHO "GCC is too old, please install a newer version supporting C++11"
+if [ $GCC_VERSION -eq 0 ] || [ $GCC_VERSION -lt 50000 ]; then
+    >&2 $ECHO "C++ compiler is too old, please install GCC 5.0+ or Clang 3.5+ with C++14 support"
     exit 1
 fi
 
@@ -175,11 +208,14 @@ if [ "$SYSTEM" = "Darwin" ]; then
     fi
 fi
 
+print_step "Checking dependencies"
+
 # User specified path of openssl, if not given it's empty
 OPENSSL_LIB=$(find_dir_of_lib ssl)
 # Inconvenient to check these headers in baidu-internal
 #PTHREAD_HDR=$(find_dir_of_header_or_die pthread.h)
 OPENSSL_HDR=$(find_dir_of_header_or_die openssl/ssl.h mesalink/openssl/ssl.h)
+print_success "Found openssl: lib=${OPENSSL_LIB:-system}, hdr=${OPENSSL_HDR}"
 
 if [ $WITH_MESALINK != 0 ]; then
     MESALINK_HDR=$(find_dir_of_header_or_die mesalink/openssl/ssl.h)
@@ -228,11 +264,14 @@ append_linking() {
 
 GFLAGS_LIB=$(find_dir_of_lib_or_die gflags)
 append_linking $GFLAGS_LIB gflags
+print_success "Found gflags: $GFLAGS_LIB"
 
 PROTOBUF_LIB=$(find_dir_of_lib_or_die protobuf)
 append_linking $PROTOBUF_LIB protobuf
+print_success "Found protobuf: $PROTOBUF_LIB"
 
 LEVELDB_LIB=$(find_dir_of_lib_or_die leveldb)
+print_success "Found leveldb: $LEVELDB_LIB"
 # required by leveldb
 if [ -f $LEVELDB_LIB/libleveldb.a ]; then
     if [ -f $LEVELDB_LIB/libleveldb.$SO ]; then
@@ -261,12 +300,18 @@ else
 fi
 
 PROTOC=$(find_bin_or_die protoc)
+print_success "Found protoc: $PROTOC"
 
 GFLAGS_HDR=$(find_dir_of_header_or_die gflags/gflags.h)
 
 PROTOBUF_HDR=$(find_dir_of_header_or_die google/protobuf/message.h)
 PROTOBUF_VERSION=$(grep '#define GOOGLE_PROTOBUF_VERSION [0-9]\+' $PROTOBUF_HDR/google/protobuf/stubs/common.h | awk '{print $3}')
 if [ "$PROTOBUF_VERSION" -ge 4022000 ]; then
+    # from v22, utf8_validity should be explicitly linked
+    # https://github.com/protocolbuffers/protobuf/blob/a847a8dc4ba1d99e7ba917146c84438b4de7d085/cmake/libprotobuf.cmake#L47
+    UTF8_VALIDITY_LIB=$(find_dir_of_lib utf8_validity)
+    append_linking "$UTF8_VALIDITY_LIB" utf8_validity
+
     ABSL_HDR=$(find_dir_of_header_or_die absl/base/config.h)
     ABSL_LIB=$(find_dir_of_lib_or_die absl_strings)
     ABSL_TARGET_NAMES="
@@ -343,8 +388,10 @@ if [ "$PROTOBUF_VERSION" -ge 4022000 ]; then
         fi
     done
     CXXFLAGS="-std=c++17"
+    print_success "Found protobuf version $PROTOBUF_VERSION (>= v22, using C++17 with abseil)"
 else
-    CXXFLAGS="-std=c++0x"
+    CXXFLAGS="-std=c++14"
+    print_success "Found protobuf version $PROTOBUF_VERSION"
 fi
 
 CPPFLAGS=
@@ -363,6 +410,8 @@ if [ $WITH_BTHREAD_TRACER != 0 ]; then
     fi
     LIBUNWIND_HDR=$(find_dir_of_header_or_die libunwind.h)
     LIBUNWIND_LIB=$(find_dir_of_lib_or_die unwind)
+    ABSL_HDR=$(find_dir_of_header_or_die absl/base/config.h)
+    ABSL_LIB=$(find_dir_of_lib_or_die absl_symbolize)
 
     CPPFLAGS="${CPPFLAGS} -DBRPC_BTHREAD_TRACER"
 
@@ -370,6 +419,11 @@ if [ $WITH_BTHREAD_TRACER != 0 ]; then
         DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -lunwind -lunwind-x86_64"
     else
         STATIC_LINKINGS="$STATIC_LINKINGS -lunwind -lunwind-x86_64"
+    fi
+    if [ -f "$ABSL_LIB/libabsl_base.$SO" ]; then
+        DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -labsl_stacktrace -labsl_symbolize -labsl_debugging_internal -labsl_demangle_internal -labsl_malloc_internal -labsl_raw_logging_internal -labsl_spinlock_wait -labsl_base"
+    else
+        STATIC_LINKINGS="$STATIC_LINKINGS -labsl_stacktrace -labsl_symbolize -labsl_debugging_internal -labsl_demangle_internal -labsl_malloc_internal -labsl_raw_logging_internal -labsl_spinlock_wait -labsl_base"
     fi
 fi
 
@@ -432,7 +486,7 @@ append_to_output "STATIC_LINKINGS=$STATIC_LINKINGS"
 append_to_output "DYNAMIC_LINKINGS=$DYNAMIC_LINKINGS"
 
 # CPP means C PreProcessing, not C PlusPlus
-CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_GLOG=$WITH_GLOG -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=$BRPC_DEBUG_BTHREAD_SCHE_SAFETY -DBRPC_DEBUG_LOCK=$BRPC_DEBUG_LOCK"
+CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_GLOG=$WITH_GLOG -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=$BRPC_DEBUG_BTHREAD_SCHE_SAFETY -DBRPC_DEBUG_LOCK=$BRPC_DEBUG_LOCK -DBUTIL_USE_CPU_FREQUENCY=$WITH_CPU_FREQUENCY"
 
 # Avoid over-optimizations of TLS variables by GCC>=4.8
 # See: https://github.com/apache/brpc/issues/1693
@@ -489,6 +543,42 @@ if [ $WITH_RDMA != 0 ]; then
     append_to_output "WITH_RDMA=1"
 fi
 
+if [ $WITH_URMA != 0 ]; then
+    URMA_LIB=$(find_dir_of_lib urma)
+    URMA_HDR=$(find_dir_of_header urma_api.h)
+    if [ -z "$URMA_HDR" ]; then
+        >&2 $ECHO "Fail to find urma_api.h from --headers"
+        exit 1
+    fi
+    URMA_BOND_HDR=$(find_dir_of_header urma_ubagg.h)
+    CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_URMA=1"
+    append_to_output "WITH_URMA=1"
+    append_to_output_headers "$URMA_HDR"
+    if [ -n "$URMA_BOND_HDR" ]; then
+        append_to_output_headers "$URMA_BOND_HDR"
+    fi
+    if [ "$URMA_MOCK_MODE" = "on" ]; then
+        append_to_output "URMA_USE_MOCK=1"
+        print_info "URMA mock forced by --with-urma-mock"
+    elif [ "$URMA_MOCK_MODE" = "off" ]; then
+        if [ -z "$URMA_LIB" ]; then
+            >&2 $ECHO "--without-urma-mock requires liburma"
+            exit 1
+        fi
+        append_to_output_libs "$URMA_LIB"
+        append_to_output "DYNAMIC_LINKINGS+=-lurma"
+        append_to_output "URMA_USE_MOCK=0"
+        print_info "URMA mock disabled by --without-urma-mock"
+    elif [ -n "$URMA_LIB" ]; then
+        append_to_output_libs "$URMA_LIB"
+        append_to_output "DYNAMIC_LINKINGS+=-lurma"
+        append_to_output "URMA_USE_MOCK=0"
+    else
+        append_to_output "URMA_USE_MOCK=1"
+        print_info "liburma not found; using URMA link-time mock"
+    fi
+fi
+
 if [ $WITH_MESALINK != 0 ]; then
     CPPFLAGS="${CPPFLAGS} -DUSE_MESALINK"
 fi
@@ -496,11 +586,22 @@ fi
 append_to_output "CPPFLAGS=${CPPFLAGS}"
 append_to_output "# without the flag, linux+arm64 may crash due to folding on TLS.
 ifeq (\$(CC),gcc)
-  ifeq (\$(shell uname -p),aarch64) 
+  ifeq (\$(shell uname -p),aarch64)
     CPPFLAGS+=-fno-gcse
   endif
 endif
 "
+
+# RISC-V Zvbc/Zbc support
+if [ "$(uname -m)" = "riscv64" ]; then
+    if [ $WITH_RISCV_ZVBC != 0 ]; then
+        CXXFLAGS="${CXXFLAGS} -march=rv64gcv_zbc_zvbc"
+        print_success "RISC-V Zvbc enabled: -march=rv64gcv_zbc_zvbc"
+    elif [ $WITH_RISCV_ZBC != 0 ]; then
+        CXXFLAGS="${CXXFLAGS} -march=rv64gc_zbc"
+        print_success "RISC-V Zbc enabled: -march=rv64gc_zbc"
+    fi
+fi
 
 append_to_output "CXXFLAGS=${CXXFLAGS}"
 
@@ -591,8 +692,31 @@ cat << EOF > src/butil/config.h
 #endif
 #define BRPC_WITH_GLOG $WITH_GLOG
 
+#ifdef BUTIL_USE_CPU_FREQUENCY
+#undef BUTIL_USE_CPU_FREQUENCY
+#endif
+#define BUTIL_USE_CPU_FREQUENCY $WITH_CPU_FREQUENCY
+
 #endif  // BUTIL_CONFIG_H
 EOF
 
+print_step "Generating output files"
+
 # write to config.mk
 $ECHO "$OUTPUT_CONTENT" > config.mk
+print_success "Generated config.mk"
+print_success "Generated src/butil/config.h"
+
+printf "\n"
+print_step "Configuration complete"
+print_info "Compiler:  $CC / $CXX"
+print_info "C++ std:   $CXXFLAGS"
+print_info "System:    $SYSTEM"
+if [ $WITH_GLOG -ne 0 ]; then print_info "With glog: yes"; fi
+if [ $WITH_THRIFT -ne 0 ]; then print_info "With thrift: yes"; fi
+if [ $WITH_RDMA -ne 0 ]; then print_info "With RDMA: yes"; fi
+if [ $WITH_URMA -ne 0 ]; then print_info "With URMA: yes"; fi
+if [ $WITH_MESALINK -ne 0 ]; then print_info "With MesaLink: yes"; fi
+if [ $WITH_BTHREAD_TRACER -ne 0 ]; then print_info "With bthread tracer: yes"; fi
+if [ $WITH_ASAN -ne 0 ]; then print_info "With ASAN: yes"; fi
+printf "\n${GREEN}brpc is now configured. You can build it with 'make'.${NC}\n"

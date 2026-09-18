@@ -156,16 +156,16 @@ PrometheusMetricsDumper::ProcessLatencyRecorderSuffix(const butil::StringPiece& 
     if (metric_name.ends_with("_latency")) {
         metric_name.remove_suffix(8);
         SummaryItems* si = &_m[metric_name.as_string()];
-        si->latency_avg = strtoll(desc_str.data(), NULL, 10);
+        si->latency_avg = strtoll(desc_str.data(), nullptr, 10);
         return si;
     }
     if (metric_name.ends_with("_count")) {
         metric_name.remove_suffix(6);
         SummaryItems* si = &_m[metric_name.as_string()];
-        si->count = strtoll(desc_str.data(), NULL, 10);
+        si->count = strtoll(desc_str.data(), nullptr, 10);
         return si;
     }
-    return NULL;
+    return nullptr;
 }
 
 bool PrometheusMetricsDumper::DumpLatencyRecorderSuffix(
@@ -181,6 +181,12 @@ bool PrometheusMetricsDumper::DumpLatencyRecorderSuffix(
     if (!si->IsComplete()) {
         return true;
     }
+    // The average latency can not be a quantile series of the summary below,
+    // because the quantile label must be parsable as a float. Dump it as a
+    // separate gauge, which is the same as the multi dimension one does.
+    *_os << "# HELP " << si->metric_name << "_avg_latency" << '\n'
+         << "# TYPE " << si->metric_name << "_avg_latency gauge\n"
+         << si->metric_name << "_avg_latency " << si->latency_avg << '\n';
     *_os << "# HELP " << si->metric_name << '\n'
          << "# TYPE " << si->metric_name << " summary\n"
          << si->metric_name << "{quantile=\""
@@ -198,8 +204,6 @@ bool PrometheusMetricsDumper::DumpLatencyRecorderSuffix(
          << si->latency_percentiles[4] << '\n'
          << si->metric_name << "{quantile=\"1\"} "
          << si->latency_percentiles[5] << '\n'
-         << si->metric_name << "{quantile=\"avg\"} "
-         << si->latency_avg << '\n'
          << si->metric_name << "_sum "
          // There is no sum of latency in bvar output, just use
          // average * count as approximation
@@ -224,7 +228,7 @@ void PrometheusMetricsService::default_method(::google::protobuf::RpcController*
 int DumpPrometheusMetricsToIOBuf(butil::IOBuf* output) {
     butil::IOBufBuilder os;
     PrometheusMetricsDumper dumper(&os, g_server_info_prefix);
-    const int ndump = bvar::Variable::dump_exposed(&dumper, NULL);
+    const int ndump = bvar::Variable::dump_exposed(&dumper, nullptr);
     if (ndump < 0) {
         return -1;
     }
@@ -232,7 +236,7 @@ int DumpPrometheusMetricsToIOBuf(butil::IOBuf* output) {
 
     if (bvar::FLAGS_bvar_max_dump_multi_dimension_metric_number > 0) {
         PrometheusMetricsDumper dumper_md(&os, g_server_info_prefix);
-        const int ndump_md = bvar::MVariable::dump_exposed(&dumper_md, NULL);
+        const int ndump_md = bvar::MVariableBase::dump_exposed(&dumper_md, nullptr);
         if (ndump_md < 0) {
             return -1;
         }

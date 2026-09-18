@@ -26,7 +26,7 @@ EventDispatcher::EventDispatcher()
     : _event_dispatcher_fd(-1)
     , _stop(false)
     , _tid(0)
-    , _thread_attr(BTHREAD_ATTR_EPOLL) {
+    , _thread_attr(BTHREAD_ATTR_NORMAL) {
     _event_dispatcher_fd = epoll_create(1024 * 1024);
     if (_event_dispatcher_fd < 0) {
         PLOG(FATAL) << "Fail to create epoll";
@@ -55,7 +55,7 @@ EventDispatcher::~EventDispatcher() {
     }
 }
 
-int EventDispatcher::Start(const bthread_attr_t* consumer_thread_attr) {
+int EventDispatcher::Start(const bthread_attr_t* thread_attr) {
     if (_event_dispatcher_fd < 0) {
         LOG(FATAL) << "epoll was not created";
         return -1;
@@ -69,13 +69,16 @@ int EventDispatcher::Start(const bthread_attr_t* consumer_thread_attr) {
 
     // Set _thread_attr before creating epoll thread to make sure
     // everyting seems sane to the thread.
-    if (consumer_thread_attr) {
-        _thread_attr = *consumer_thread_attr | BTHREAD_GLOBAL_PRIORITY;
+    if (thread_attr) {
+        _thread_attr = *thread_attr;
     }
 
     //_thread_attr is used in StartInputEvent(), assign flag NEVER_QUIT to it will cause new bthread
     // that created by epoll_wait() never to quit.
-    bthread_attr_t epoll_thread_attr = _thread_attr | BTHREAD_NEVER_QUIT;
+    // Only event dispatcher thread has flag BTHREAD_GLOBAL_PRIORITY.
+    bthread_attr_t epoll_thread_attr =
+        _thread_attr | BTHREAD_NEVER_QUIT | BTHREAD_GLOBAL_PRIORITY;
+    bthread_attr_set_name(&epoll_thread_attr, "EventDispatcher::RunThis");
 
     // Polling thread uses the same attr for consumer threads (NORMAL right
     // now). Previously, we used small stack (32KB) which may be overflowed
@@ -98,14 +101,14 @@ void EventDispatcher::Stop() {
     _stop = true;
 
     if (_event_dispatcher_fd >= 0) {
-        epoll_event evt = { EPOLLOUT,  { NULL } };
+        epoll_event evt = { EPOLLOUT,  { nullptr } };
         epoll_ctl(_event_dispatcher_fd, EPOLL_CTL_ADD, _wakeup_fds[1], &evt);
     }
 }
 
 void EventDispatcher::Join() {
     if (_tid) {
-        bthread_join(_tid, NULL);
+        bthread_join(_tid, nullptr);
         _tid = 0;
     }
 }
@@ -149,7 +152,7 @@ int EventDispatcher::UnregisterEvent(IOEventDataId event_data_id,
 #endif
         return epoll_ctl(_event_dispatcher_fd, EPOLL_CTL_MOD, fd, &evt);
     } else {
-        return epoll_ctl(_event_dispatcher_fd, EPOLL_CTL_DEL, fd, NULL);
+        return epoll_ctl(_event_dispatcher_fd, EPOLL_CTL_DEL, fd, nullptr);
     }
     return -1;
 }
@@ -179,7 +182,7 @@ int EventDispatcher::RemoveConsumer(int fd) {
     // from epoll again! If the fd was level-triggered and there's data left,
     // epoll_wait will keep returning events of the fd continuously, making
     // program abnormal.
-    if (epoll_ctl(_event_dispatcher_fd, EPOLL_CTL_DEL, fd, NULL) < 0) {
+    if (epoll_ctl(_event_dispatcher_fd, EPOLL_CTL_DEL, fd, nullptr) < 0) {
         PLOG(WARNING) << "Fail to remove fd=" << fd << " from epfd=" << _event_dispatcher_fd;
         return -1;
     }
@@ -187,8 +190,14 @@ int EventDispatcher::RemoveConsumer(int fd) {
 }
 
 void* EventDispatcher::RunThis(void* arg) {
-    ((EventDispatcher*)arg)->Run();
-    return NULL;
+    EventDispatcher* ed = (EventDispatcher*)arg;
+    if (ed->_priority_index >= 0) {
+        bthread::TaskMeta* meta =
+            bthread::TaskGroup::address_meta(bthread_self());
+        meta->priority_index = ed->_priority_index;
+    }
+    ed->Run();
+    return nullptr;
 }
 
 void EventDispatcher::Run() {

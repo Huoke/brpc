@@ -34,13 +34,13 @@ public:
     WorkStealingQueue()
         : _bottom(1)
         , _capacity(0)
-        , _buffer(NULL)
+        , _buffer(nullptr)
         , _top(1) {
     }
 
     ~WorkStealingQueue() {
         delete [] _buffer;
-        _buffer = NULL;
+        _buffer = nullptr;
     }
 
     int init(size_t capacity) {
@@ -57,10 +57,7 @@ public:
                        << " which must be power of 2";
             return -1;
         }
-        _buffer = new(std::nothrow) T[capacity];
-        if (NULL == _buffer) {
-            return -1;
-        }
+        _buffer = new T[capacity];
         _capacity = capacity;
         return 0;
     }
@@ -128,7 +125,7 @@ public:
                 return false;
             }
             *val = _buffer[t & (_capacity - 1)];
-        } while (!_top.compare_exchange_strong(t, t + 1,
+        } while (!_top.compare_exchange_weak(t, t + 1,
                                                butil::memory_order_seq_cst,
                                                butil::memory_order_relaxed));
         return true;

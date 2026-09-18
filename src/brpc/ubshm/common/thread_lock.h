@@ -15,19 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BUTIL_TEST_SSTREAM_WORKAROUND
-#define BUTIL_TEST_SSTREAM_WORKAROUND
+#ifndef BRPC_THREAD_LOCK_H
+#define BRPC_THREAD_LOCK_H
+#include <unistd.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <semaphore.h>
+#include <pthread.h>
+#include "brpc/ubshm/common/common.h"
 
-// defining private as public makes it fail to compile sstream with gcc5.x like this:
-// "error: ‘struct std::__cxx11::basic_stringbuf<_CharT, _Traits, _Alloc>::
-// __xfer_bufptrs’ redeclared with different access"
-
-#ifdef private
-# undef private
-# include <sstream>
-# define private public
-#else
-# include <sstream>
+#ifdef __cplusplus
+extern "C" {
 #endif
 
-#endif  //  BUTIL_TEST_SSTREAM_WORKAROUND
+static inline void UnlockMutex(pthread_mutex_t **mtx)
+{
+    if (LIKELY(mtx != nullptr && *mtx != nullptr)) {
+        pthread_mutex_unlock(*mtx);
+    } else {
+        LOG(ERROR) << "Invalid input for mtx.";
+    }
+}
+
+#define LOCK_GUARD(mtx_ptr)                                             \
+    pthread_mutex_t *__attribute__((cleanup(UnlockMutex))) _mtx_ptr = ({ \
+        pthread_mutex_lock(&(mtx_ptr));                                 \
+        &(mtx_ptr);                                                     \
+    })
+
+#ifdef __cplusplus
+}
+#endif
+#endif //BRPC_THREAD_LOCK_H

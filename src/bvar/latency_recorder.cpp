@@ -24,6 +24,25 @@
 
 namespace bvar {
 
+#if !WITH_BABYLON_COUNTER
+// Verify how ReducerSampler picks its data source, using the very hosts that
+// LatencyRecorder is made of.
+// Hosts keeping their data in a shared combiner are sampled through that carrier,
+// so sampling reads valid memory even if the host is destructed before the sampler
+// is recycled.
+// PassiveStatus keeps its data in a user callback instead, hence it is still sampled
+// through the host pointer.
+static_assert(detail::HasShareCombiner<IntRecorder>::value,
+              "IntRecorder should be sampled through its shared combiner");
+static_assert(detail::HasShareCombiner<Maxer<int64_t>::Base>::value,
+              "Reducer should be sampled through its shared combiner");
+static_assert(detail::HasShareCombiner<detail::Percentile>::value,
+              "Percentile should be sampled through its shared combiner");
+static_assert(!detail::HasShareCombiner<PassiveStatus<int64_t> >::value,
+              "PassiveStatus has no shared carrier, it must keep being sampled"
+              " through the host pointer");
+#endif // !WITH_BABYLON_COUNTER
+
 static bool valid_percentile(const char*, int32_t v) {
     return v > 0 && v < 100;
 }
@@ -55,7 +74,7 @@ void CDF::describe(std::ostream& os, bool) const {
 
 int CDF::describe_series(
     std::ostream& os, const SeriesOptions& options) const {
-    if (_w == NULL) {
+    if (_w == nullptr) {
         return 1;
     }
     if (options.test_only) {
@@ -99,7 +118,7 @@ static int64_t double_to_random_int(double dval) {
 }
 
 static int64_t get_window_recorder_qps(void* arg) {
-    detail::Sample<Stat> s;
+    Sample<Stat> s;
     static_cast<RecorderWindow*>(arg)->get_span(&s);
     // Use floating point to avoid overflow.
     if (s.time_us <= 0) {
@@ -253,10 +272,12 @@ int LatencyRecorder::expose(const butil::StringPiece& prefix1,
     if (_latency_percentiles.expose_as(prefix, "latency_percentiles", DISPLAY_ON_HTML) != 0) {
         return -1;
     }
-    snprintf(namebuf, sizeof(namebuf), "%d%%,%d%%,%d%%,99.9%%",
-             (int)FLAGS_bvar_latency_p1, (int)FLAGS_bvar_latency_p2,
-             (int)FLAGS_bvar_latency_p3);
-    CHECK_EQ(0, _latency_percentiles.set_vector_names(namebuf));
+    if (FLAGS_save_series) {
+        snprintf(namebuf, sizeof(namebuf), "%d%%,%d%%,%d%%,99.9%%",
+                 (int)FLAGS_bvar_latency_p1, (int)FLAGS_bvar_latency_p2,
+                 (int)FLAGS_bvar_latency_p3);
+        CHECK_EQ(0, _latency_percentiles.set_vector_names(namebuf));
+    }
     return 0;
 }
 

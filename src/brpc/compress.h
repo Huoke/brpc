@@ -20,6 +20,7 @@
 #define BRPC_COMPRESS_H
 
 #include <google/protobuf/message.h>              // Message
+#include <gflags/gflags_declare.h>               // DECLARE_uint64
 #include "butil/iobuf.h"                           // butil::IOBuf
 #include "butil/logging.h"
 #include "brpc/options.pb.h"                     // CompressType
@@ -27,13 +28,22 @@
 
 namespace brpc {
 
+DECLARE_uint64(max_decompressed_body_size);
+
+// Effective limit (in bytes) on the decompressed size of a single message
+// body: FLAGS_max_decompressed_body_size, or 32 x FLAGS_max_body_size when
+// the flag is 0 (the default). Decompressors must fail once their output
+// exceeds this limit, otherwise a small compressed body that passes
+// -max_body_size may expand to tens of GiB (decompression bomb).
+uint64_t MaxDecompressedBodySize();
+
 // Serializer can be used to implement custom serialization
 // before compression with user callback.
 class Serializer : public NonreflectableMessage<Serializer> {
 public:
     using Callback = std::function<bool(google::protobuf::io::ZeroCopyOutputStream*)>;
 
-    Serializer() :Serializer(NULL) {}
+    Serializer() :Serializer(nullptr) {}
 
     explicit Serializer(Callback callback)
         :_callback(std::move(callback)) {
@@ -100,7 +110,7 @@ public:
 public:
     using Callback = std::function<bool(google::protobuf::io::ZeroCopyInputStream*)>;
 
-    Deserializer() :Deserializer(NULL) {}
+    Deserializer() :Deserializer(nullptr) {}
 
     explicit Deserializer(Callback callback) : _callback(std::move(callback)) {
         SharedCtor();
@@ -175,7 +185,7 @@ struct CompressHandler {
 // Returns 0 on success, -1 otherwise
 int RegisterCompressHandler(CompressType type, CompressHandler handler);
 
-// Returns CompressHandler pointer of `type' if registered, NULL otherwise.
+// Returns CompressHandler pointer of `type' if registered, nullptr otherwise.
 const CompressHandler* FindCompressHandler(CompressType type);
 
 // Returns the `name' of the CompressType if registered

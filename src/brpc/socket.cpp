@@ -50,8 +50,7 @@
 #include "brpc/policy/rtmp_protocol.h"  // FIXME
 #include "brpc/periodic_task.h"
 #include "brpc/details/health_check.h"
-#include "brpc/rdma/rdma_endpoint.h"
-#include "brpc/rdma/rdma_helper.h"
+#include "brpc/transport_factory.h"
 #if defined(OS_MACOSX)
 #include <sys/event.h>
 #endif
@@ -81,6 +80,13 @@ DEFINE_int32(socket_send_buffer_size, -1,
             "Set send buffer size of sockets if this value is positive");
 
 DEFINE_int32(ssl_bio_buffer_size, 16*1024, "Set buffer size for SSL read/write");
+
+DEFINE_int32(ssl_handshake_timeout_ms, 5000,
+             "Max duration of one SSL handshake on a socket. Zero or negative "
+             "disables the limit and falls back to waiting forever, which can "
+             "leak ESTABLISHED sockets if the peer never finishes the TLS "
+             "handshake (e.g. server not actually listening with SSL).");
+BRPC_VALIDATE_GFLAG(ssl_handshake_timeout_ms, PassValidate);
 
 DEFINE_int64(socket_max_unwritten_bytes, 64 * 1024 * 1024,
              "Max unwritten bytes in each socket, if the limit is reached,"
@@ -202,30 +208,27 @@ public:
 };
 
 Socket::SharedPart::SharedPart(SocketId creator_socket_id2)
-    : socket_pool(NULL)
+    : socket_pool(nullptr)
     , creator_socket_id(creator_socket_id2)
     , num_continuous_connect_timeouts(0)
     , in_size(0)
     , in_num_messages(0)
     , out_size(0)
     , out_num_messages(0)
-    , extended_stat(NULL)
+    , extended_stat(nullptr)
     , recent_error_count(0) {
 }
 
 Socket::SharedPart::~SharedPart() {
     delete extended_stat;
-    extended_stat = NULL;
-    delete socket_pool.exchange(NULL, butil::memory_order_relaxed);
+    extended_stat = nullptr;
+    delete socket_pool.exchange(nullptr, butil::memory_order_relaxed);
 }
 
 void Socket::SharedPart::UpdateStatsEverySecond(int64_t now_ms) {
     ExtendedSocketStat* stat = extended_stat;
-    if (stat == NULL) {
-        stat = new (std::nothrow) ExtendedSocketStat;
-        if (stat == NULL) {
-            return;
-        }
+    if (stat == nullptr) {
+        stat = new ExtendedSocketStat;
         extended_stat = stat;
     }
 
@@ -278,7 +281,7 @@ void Socket::SharedPart::UpdateStatsEverySecond(int64_t now_ms) {
     }
 }
 
-SocketVarsCollector* g_vars = NULL;
+SocketVarsCollector* g_vars = nullptr;
 
 static pthread_once_t s_create_vars_once = PTHREAD_ONCE_INIT;
 static void CreateVars() {
@@ -365,9 +368,9 @@ struct BAIDU_CACHELINE_ALIGNMENT Socket::WriteRequest {
                 butil::IOBuf dummy_buf;
                 // We don't care about the return value since the request
                 // is already failed.
-                (void)msg->AppendAndDestroySelf(&dummy_buf, NULL);
+                (void)msg->AppendAndDestroySelf(&dummy_buf, nullptr);
             }
-            set_pipelined_count_and_user_message(0, NULL, 0);
+            set_pipelined_count_and_user_message(0, nullptr, 0);
             return true;
         }
         return false;
@@ -422,7 +425,7 @@ Socket::WriteRequest* const Socket::WriteRequest::UNCONNECTED =
 class Socket::EpollOutRequest : public SocketUser {
 public:
     EpollOutRequest() : fd(-1), timer_id(0)
-                      , on_epollout_event(NULL), data(NULL) {}
+                      , on_epollout_event(nullptr), data(nullptr) {}
 
     ~EpollOutRequest() override {
         // Remove the timer at last inside destructor to avoid
@@ -449,53 +452,53 @@ static const uint64_t AUTH_FLAG = (1ul << 32);
 Socket::Socket(Forbidden f)
     // must be even because Address() relies on evenness of version
     : VersionedRefWithId<Socket>(f)
-    , _shared_part(NULL)
+    , _shared_part(nullptr)
     , _nevent(0)
-    , _keytable_pool(NULL)
+    , _keytable_pool(nullptr)
     , _fd(-1)
     , _tos(0)
     , _reset_fd_real_us(-1)
-    , _on_edge_triggered_events(NULL)
-    , _user(NULL)
-    , _conn(NULL)
+    , _fd_version(0)
+    , _on_edge_triggered_events(nullptr)
+    , _need_on_edge_trigger(false)
+    , _user(nullptr)
+    , _conn(nullptr)
     , _preferred_index(-1)
     , _hc_count(0)
-    , _last_msg_size(0)
-    , _avg_msg_size(0)
     , _last_readtime_us(0)
-    , _parsing_context(NULL)
+    , _parsing_context(nullptr)
+    , _parsing_stream_type(InputMessengerProcessor::STREAM_NONE)
     , _correlation_id(0)
     , _health_check_interval_s(-1)
     , _is_hc_related_ref_held(false)
-    , _hc_started(false)
     , _ninprocess(1)
     , _auth_flag_error(0)
     , _auth_id(INVALID_BTHREAD_ID)
-    , _auth_context(NULL)
+    , _auth_context(nullptr)
     , _ssl_state(SSL_UNKNOWN)
-    , _ssl_session(NULL)
-    , _rdma_ep(NULL)
-    , _rdma_state(RDMA_OFF)
+    , _ssl_session(nullptr)
+    , _socket_mode(SOCKET_MODE_TCP)
     , _connection_type_for_progressive_read(CONNECTION_TYPE_UNKNOWN)
     , _controller_released_socket(false)
     , _overcrowded(false)
     , _fail_me_at_server_stop(false)
     , _logoff_flag(false)
     , _error_code(0)
-    , _pipeline_q(NULL)
+    , _pipeline_q(nullptr)
     , _last_writetime_us(0)
     , _unwritten_bytes(0)
-    , _epollout_butex(NULL)
-    , _write_head(NULL)
+    , _epollout_butex(nullptr)
+    , _write_head(nullptr)
     , _is_write_shutdown(false)
-    , _stream_set(NULL)
+    , _stream_set(nullptr)
     , _total_streams_unconsumed_size(0)
     , _ninflight_app_health_check(0)
     , _tcp_user_timeout_ms(-1)
     , _http_request_method(HTTP_METHOD_GET) {
     CreateVarsOnce();
-    pthread_mutex_init(&_id_wait_list_mutex, NULL);
+    pthread_mutex_init(&_id_wait_list_mutex, nullptr);
     _epollout_butex = bthread::butex_create_checked<butil::atomic<int> >();
+    _fd_input_processor.Init(this, InputMessengerProcessor::STREAM_TCP_FD);
 }
 
 Socket::~Socket() {
@@ -535,7 +538,7 @@ void Socket::ReturnFailedWriteRequest(Socket::WriteRequest* p, int error_code,
 Socket::WriteRequest* Socket::ReleaseWriteRequestsExceptLast(
     Socket::WriteRequest* req, int error_code, const std::string& error_text) {
     WriteRequest* p = req;
-    while (p->next != NULL) {
+    while (p->next != nullptr) {
         WriteRequest* const saved_next = p->next;
         ReturnFailedWriteRequest(p, error_code, error_text);
         p = saved_next;
@@ -563,18 +566,20 @@ void Socket::ReleaseAllFailedWriteRequests(Socket::WriteRequest* req) {
             CancelUnwrittenBytes(req->data.size());
         }
         req->data.clear();  // MUST, otherwise IsWriteComplete is false
-    } while (!IsWriteComplete(req, true, NULL));
+    } while (!IsWriteComplete(req, true, nullptr));
     ReturnFailedWriteRequest(req, error_code, error_text);
 }
 
 int Socket::ResetFileDescriptor(int fd) {
     // Reset message sizes when fd is changed.
-    _last_msg_size = 0;
-    _avg_msg_size = 0;
+    _fd_input_processor.ResetMsgSizeStats();
     // MUST store `_fd' before adding itself into epoll device to avoid
     // race conditions with the callback function inside epoll
+    static butil::atomic<uint64_t> BAIDU_CACHELINE_ALIGNMENT fd_version(0);
+    _fd_version.store(fd_version.fetch_add(1, butil::memory_order_relaxed),
+                      butil::memory_order_relaxed);
     _fd.store(fd, butil::memory_order_release);
-    _reset_fd_real_us = butil::gettimeofday_us();
+    _reset_fd_real_us = butil::cpuwide_time_us();
     if (!ValidFileDescriptor(fd)) {
         return 0;
     }
@@ -602,7 +607,7 @@ int Socket::ResetFileDescriptor(int fd) {
 
     SetSocketOptions(fd);
 
-    if (_on_edge_triggered_events) {
+    if (_transport->HasOnEdgeTrigger()) {
         if (_io_event.AddConsumer(fd) != 0) {
             PLOG(ERROR) << "Fail to add SocketId=" << id() 
                         << " into EventDispatcher";
@@ -617,22 +622,6 @@ void Socket::SetSocketOptions(int fd) {
     if (_tos > 0 &&
         setsockopt(fd, IPPROTO_IP, IP_TOS, &_tos, sizeof(_tos)) != 0) {
         PLOG(ERROR) << "Fail to set tos of fd=" << fd << " to " << _tos;
-    }
-
-    if (FLAGS_socket_send_buffer_size > 0) {
-        int buff_size = FLAGS_socket_send_buffer_size;
-        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buff_size, sizeof(buff_size)) != 0) {
-            PLOG(ERROR) << "Fail to set sndbuf of fd=" << fd << " to "
-                        << buff_size;
-        }
-    }
-
-    if (FLAGS_socket_recv_buffer_size > 0) {
-        int buff_size = FLAGS_socket_recv_buffer_size;
-        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buff_size, sizeof(buff_size)) != 0) {
-            PLOG(ERROR) << "Fail to set rcvbuf of fd=" << fd << " to "
-                        << buff_size;
-        }
     }
 
 #if defined(OS_LINUX)
@@ -705,6 +694,24 @@ void Socket::SetSocketOptions(int fd) {
 #endif
 }
 
+void SetSocketBufferOptions(int fd) {
+    if (FLAGS_socket_send_buffer_size > 0) {
+        int buff_size = FLAGS_socket_send_buffer_size;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buff_size, sizeof(buff_size)) != 0) {
+            PLOG(ERROR) << "Fail to set sndbuf of fd=" << fd << " to "
+                        << buff_size;
+        }
+    }
+
+    if (FLAGS_socket_recv_buffer_size > 0) {
+        int buff_size = FLAGS_socket_recv_buffer_size;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buff_size, sizeof(buff_size)) != 0) {
+            PLOG(ERROR) << "Fail to set rcvbuf of fd=" << fd << " to "
+                        << buff_size;
+        }
+    }
+}
+
 // SocketId = 32-bit version + 32-bit slot.
 //   version: from version part of _versioned_nref, must be an EVEN number.
 //   slot: designated by ResourcePool.
@@ -722,21 +729,31 @@ int Socket::OnCreated(const SocketOptions& options) {
     auto guard = butil::MakeScopeGuard([this] {
         _io_event.Reset();
     });
+    // start build the transport
+    _socket_mode = options.socket_mode;
+    _transport = TransportFactory::CreateTransport(options.socket_mode);
+    CHECK(nullptr != _transport);
+    _transport->Init(this, options);
 
     g_vars->nsocket << 1;
-    CHECK(NULL == _shared_part.load(butil::memory_order_relaxed));
+    CHECK(nullptr == _shared_part.load(butil::memory_order_relaxed));
     _nevent.store(0, butil::memory_order_relaxed);
     _keytable_pool = options.keytable_pool;
     _tos = 0;
     _remote_side = options.remote_side;
-    _local_side = butil::EndPoint();
+    _local_side = options.local_side;
+    _bind_local_side = options.local_side;
+    _device_name = options.device_name;
     _on_edge_triggered_events = options.on_edge_triggered_events;
+    _need_on_edge_trigger = options.need_on_edge_trigger;
     _user = options.user;
     _conn = options.conn;
-    _app_connect = options.app_connect;
+    _app_connect = _transport->Connect();
     _preferred_index = -1;
     _hc_count = 0;
-    CHECK(_read_buf.empty());
+    CHECK(_fd_input_processor.read_buf().empty());
+    _parsing_stream_type.store(InputMessengerProcessor::STREAM_NONE,
+                               butil::memory_order_relaxed);
     const int64_t cpuwide_now = butil::cpuwide_time_us();
     _last_readtime_us.store(cpuwide_now, butil::memory_order_relaxed);
     reset_parsing_context(options.initial_parsing_context);
@@ -744,10 +761,9 @@ int Socket::OnCreated(const SocketOptions& options) {
     _health_check_interval_s = options.health_check_interval_s;
     _hc_option = options.hc_option;
     _is_hc_related_ref_held = false;
-    _hc_started.store(false, butil::memory_order_relaxed);
     _ninprocess.store(1, butil::memory_order_relaxed);
     _auth_flag_error.store(0, butil::memory_order_relaxed);
-    const int rc2 = bthread_id_create(&_auth_id, NULL, NULL);
+    const int rc2 = bthread_id_create(&_auth_id, nullptr, nullptr);
     if (rc2) {
         LOG(ERROR) << "Fail to create auth_id: " << berror(rc2);
         SetFailed(rc2, "Fail to create auth_id: %s", berror(rc2));
@@ -755,25 +771,9 @@ int Socket::OnCreated(const SocketOptions& options) {
     }
     _force_ssl = options.force_ssl;
     // Disable SSL check if there is no SSL context
-    _ssl_state = (options.initial_ssl_ctx == NULL ? SSL_OFF : SSL_UNKNOWN);
-    _ssl_session = NULL;
+    _ssl_state = (options.initial_ssl_ctx == nullptr ? SSL_OFF : SSL_UNKNOWN);
+    _ssl_session = nullptr;
     _ssl_ctx = options.initial_ssl_ctx;
-#if BRPC_WITH_RDMA
-    CHECK(_rdma_ep == NULL);
-    if (options.use_rdma) {
-        _rdma_ep = new (std::nothrow)rdma::RdmaEndpoint(this);
-        if (!_rdma_ep) {
-            const int saved_errno = errno;
-            PLOG(ERROR) << "Fail to create RdmaEndpoint";
-            SetFailed(saved_errno, "Fail to create RdmaEndpoint: %s",
-                         berror(saved_errno));
-            return -1;
-        }
-        _rdma_state = RDMA_UNKNOWN;
-    } else {
-        _rdma_state = RDMA_OFF;
-    }
-#endif
     _connection_type_for_progressive_read = CONNECTION_TYPE_UNKNOWN;
     _controller_released_socket.store(false, butil::memory_order_relaxed);
     _overcrowded = false;
@@ -795,12 +795,32 @@ int Socket::OnCreated(const SocketOptions& options) {
     _unwritten_bytes.store(0, butil::memory_order_relaxed);
     _keepalive_options = options.keepalive_options;
     _tcp_user_timeout_ms = options.tcp_user_timeout_ms;
-    CHECK(NULL == _write_head.load(butil::memory_order_relaxed));
+    _http_request_method = HTTP_METHOD_GET;
+    CHECK(nullptr == _write_head.load(butil::memory_order_relaxed));
     _is_write_shutdown = false;
+    // EndPoint::port is a type tag for IPv6/UDS, not a network port.
+    // Normalize only IP ports and leave Unix-domain addresses intact.
+    if (!butil::is_endpoint_extended(_bind_local_side)) {
+        _bind_local_side.port = 0;
+    } else if (butil::get_endpoint_type(_bind_local_side) == AF_INET6) {
+        sockaddr_storage addr{};
+        socklen_t addr_size = 0;
+        if (butil::endpoint2sockaddr(_bind_local_side, &addr, &addr_size) != 0) {
+            SetFailed(EINVAL, "Fail to get client binding sockaddr from %s",
+                      butil::endpoint2str(_bind_local_side).c_str());
+            return -1;
+        }
+        reinterpret_cast<sockaddr_in6*>(&addr)->sin6_port = 0;
+        if (butil::sockaddr2endpoint(&addr, addr_size, &_bind_local_side) != 0) {
+            SetFailed(ENOMEM, "Fail to create client binding endpoint from %s",
+                      butil::endpoint2str(_bind_local_side).c_str());
+            return -1;
+        }
+    }
     int fd = options.fd;
     if (!ValidFileDescriptor(fd) && options.connect_on_create) {
         // Connect on create.
-        fd = DoConnect(options.connect_abstime, NULL, NULL);
+        fd = DoConnect(options.connect_abstime, nullptr, nullptr);
         if (fd < 0) {
             PLOG(ERROR) << "Fail to connect to " << options.remote_side;
             int error_code = errno != 0 ? errno : EHOSTDOWN;
@@ -834,15 +854,15 @@ void Socket::BeforeRecycled() {
     }
     if (_conn) {
         SocketConnection* const saved_conn = _conn;
-        _conn = NULL;
+        _conn = nullptr;
         saved_conn->BeforeRecycle(this);
     }
     if (_user) {
         SocketUser* const saved_user = _user;
-        _user = NULL;
+        _user = nullptr;
         saved_user->BeforeRecycle(this);
     }
-    SharedPart* sp = _shared_part.exchange(NULL, butil::memory_order_acquire);
+    SharedPart* sp = _shared_part.exchange(nullptr, butil::memory_order_acquire);
     if (sp) {
         sp->RemoveRefManually();
     }
@@ -853,7 +873,7 @@ void Socket::BeforeRecycled() {
     };
     const int prev_fd = _fd.exchange(-1, butil::memory_order_relaxed);
     if (ValidFileDescriptor(prev_fd)) {
-        if (_on_edge_triggered_events != NULL) {
+        if (_transport->HasOnEdgeTrigger()) {
             _io_event.RemoveConsumer(prev_fd);
         }
         close(prev_fd);
@@ -861,17 +881,9 @@ void Socket::BeforeRecycled() {
             g_vars->channel_conn << -1;
         }
     }
-
-#if BRPC_WITH_RDMA
-    if (_rdma_ep) {
-        delete _rdma_ep;
-        _rdma_ep = NULL;
-        _rdma_state = RDMA_UNKNOWN;
-    }
-#endif
-
-    reset_parsing_context(NULL);
-    _read_buf.clear();
+    _transport->Release();
+    reset_parsing_context(nullptr);
+    _fd_input_processor.read_buf().clear();
 
     _auth_flag_error.store(0, butil::memory_order_relaxed);
     bthread_id_error(_auth_id, 0);
@@ -880,24 +892,24 @@ void Socket::BeforeRecycled() {
 
     if (_ssl_session) {
         SSL_free(_ssl_session);
-        _ssl_session = NULL;
+        _ssl_session = nullptr;
     }
 
-    _ssl_ctx = NULL;
+    _ssl_ctx = nullptr;
 
     delete _pipeline_q;
-    _pipeline_q = NULL;
+    _pipeline_q = nullptr;
 
     delete _auth_context;
-    _auth_context = NULL;
+    _auth_context = nullptr;
 
     delete _stream_set;
-    _stream_set = NULL;
+    _stream_set = nullptr;
 
     const SocketId asid = _agent_socket_id.load(butil::memory_order_relaxed);
     if (asid != INVALID_SOCKET_ID) {
         SocketUniquePtr ptr;
-        if (Socket::Address(asid, &ptr) == 0) {
+        if (Address(asid, &ptr) == 0) {
             ptr->ReleaseAdditionalReference();
         }
     }
@@ -915,19 +927,8 @@ void Socket::OnFailed(int error_code, const std::string& error_text) {
     // by Channel to revive never-connected socket when server side
     // comes online.
     if (HCEnabled()) {
-        bool expect = false;
-        if (_hc_started.compare_exchange_strong(expect,
-            true,
-            butil::memory_order_relaxed,
-            butil::memory_order_relaxed)) {
-            GetOrNewSharedPart()->circuit_breaker.MarkAsBroken();
-            StartHealthCheck(id(),
-                GetOrNewSharedPart()->circuit_breaker.isolation_duration_ms());
-        } else {
-            // No need to run 2 health checking at the same time.
-            RPC_VLOG << "There is already a health checking running "
-                        "for SocketId=" << id();
-        }
+        GetOrNewSharedPart()->circuit_breaker.MarkAsBroken();
+        StartHealthCheck(id(), GetOrNewSharedPart()->circuit_breaker.isolation_duration_ms());
     }
     // Wake up all threads waiting on EPOLLOUT when closing fd
     _epollout_butex->fetch_add(1, butil::memory_order_relaxed);
@@ -938,12 +939,12 @@ void Socket::OnFailed(int error_code, const std::string& error_text) {
         &_id_wait_list, error_code, error_text,
         &_id_wait_list_mutex));
     ResetAllStreams(error_code, error_text);
-    // _app_connect shouldn't be set to NULL in SetFailed otherwise
+    // _app_connect shouldn't be set to nullptr in SetFailed otherwise
     // HC is always not supported.
     // FIXME: Design a better interface for AppConnect
     // if (_app_connect) {
     //     AppConnect* const saved_app_connect = _app_connect;
-    //     _app_connect = NULL;
+    //     _app_connect = nullptr;
     //     saved_app_connect->StopConnect(this);
     // }
 }
@@ -1024,7 +1025,7 @@ int Socket::WaitAndReset(int32_t expected_nref) {
     // It's safe to close previous fd (provided expected_nref is correct).
     const int prev_fd = _fd.exchange(-1, butil::memory_order_relaxed);
     if (ValidFileDescriptor(prev_fd)) {
-        if (_on_edge_triggered_events != NULL) {
+        if (_transport->HasOnEdgeTrigger()) {
             _io_event.RemoveConsumer(prev_fd);
         }
         close(prev_fd);
@@ -1032,31 +1033,28 @@ int Socket::WaitAndReset(int32_t expected_nref) {
             g_vars->channel_conn << -1;
         }
     }
+    _transport->Reset(expected_nref);
 
-#if BRPC_WITH_RDMA
-    if (_rdma_ep) {
-        _rdma_ep->Reset();
-        _rdma_state = RDMA_UNKNOWN;
-    }
-#endif
-
+    // Clear the runtime endpoint, keeping the configured binding intact.
     _local_side = butil::EndPoint();
     if (_ssl_session) {
         SSL_free(_ssl_session);
-        _ssl_session = NULL;
+        _ssl_session = nullptr;
     }        
     _ssl_state = SSL_UNKNOWN;
     _nevent.store(0, butil::memory_order_relaxed);
     // parsing_context is very likely to be associated with the fd,
     // removing it is a safer choice and required by http2.
-    reset_parsing_context(NULL);
-    // Must clear _read_buf otehrwise even if the connections is recovered,
-    // the kept old data is likely to make parsing fail.
-    _read_buf.clear();
+    reset_parsing_context(nullptr);
+    _parsing_stream_type.store(InputMessengerProcessor::STREAM_NONE,
+                               butil::memory_order_relaxed);
+    // Must clear the read buffer otehrwise even if the connections is
+    // recovered, the kept old data is likely to make parsing fail.
+    _fd_input_processor.read_buf().clear();
     _ninprocess.store(1, butil::memory_order_relaxed);
     _auth_flag_error.store(0, butil::memory_order_relaxed);
     bthread_id_error(_auth_id, 0);
-    const int rc = bthread_id_create(&_auth_id, NULL, NULL);
+    const int rc = bthread_id_create(&_auth_id, nullptr, nullptr);
     if (rc != 0) {
         LOG(FATAL) << "Fail to create _auth_id, " << berror(rc);
         return -1;
@@ -1132,12 +1130,12 @@ int Socket::ReleaseReferenceIfIdle(int idle_seconds) {
 
 
 int Socket::SetFailed() {
-    return SetFailed(EFAILEDSOCKET, NULL);
+    return SetFailed(EFAILEDSOCKET, nullptr);
 }
 
 int Socket::SetFailed(int error_code, const char* error_fmt, ...) {
     std::string error_text;
-    if (error_fmt != NULL) {
+    if (error_fmt != nullptr) {
         va_list ap;
         va_start(ap, error_fmt);
         butil::string_vprintf(&error_text, error_fmt, ap);
@@ -1152,7 +1150,7 @@ int Socket::SetFailed(SocketId id) {
         return -1;
     }
 
-    return ptr->SetFailed(EFAILEDSOCKET, NULL);
+    return ptr->SetFailed(EFAILEDSOCKET, nullptr);
 }
 
 void Socket::NotifyOnFailed(bthread_id_t id) {
@@ -1175,7 +1173,7 @@ void Socket::NotifyOnFailed(bthread_id_t id) {
 int Socket::Status(SocketId id, int32_t* nref) {
     const butil::ResourceId<Socket> slot = SlotOfVRefId<Socket>(id);
     Socket* const m = address_resource(slot);
-    if (m != NULL) {
+    if (m != nullptr) {
         const uint64_t vref = m->versioned_ref();
         if (VersionOfVRef(vref) == VersionOfVRefId(id)) {
             if (nref) {
@@ -1192,17 +1190,10 @@ int Socket::Status(SocketId id, int32_t* nref) {
     return -1;
 }
 
-void* Socket::ProcessEvent(void* arg) {
-    // the enclosed Socket is valid and free to access inside this function.
-    SocketUniquePtr s(static_cast<Socket*>(arg));
-    s->_on_edge_triggered_events(s.get());
-    return NULL;
-}
-
 // Check if there're new requests appended.
 // If yes, point old_head to reversed new requests and return false;
 // If no:
-//    old_head is fully written, set _write_head to NULL and return true;
+//    old_head is fully written, set _write_head to nullptr and return true;
 //    old_head is not written yet, keep _write_head unchanged and return false;
 // `old_head' is last new_head got from this function or (in another word)
 // tail of current writing list.
@@ -1210,10 +1201,10 @@ void* Socket::ProcessEvent(void* arg) {
 bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
                              bool singular_node,
                              Socket::WriteRequest** new_tail) {
-    CHECK(NULL == old_head->next);
-    // Try to set _write_head to NULL to mark that the write is done.
+    CHECK(nullptr == old_head->next);
+    // Try to set _write_head to nullptr to mark that the write is done.
     WriteRequest* new_head = old_head;
-    WriteRequest* desired = NULL;
+    WriteRequest* desired = nullptr;
     bool return_when_no_more = true;
     if (!old_head->data.empty() || !singular_node) {
         desired = old_head;
@@ -1234,7 +1225,7 @@ bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
 
     // Someone added new requests.
     // Reverse the list until old_head.
-    WriteRequest* tail = NULL;
+    WriteRequest* tail = nullptr;
     WriteRequest* p = new_head;
     do {
         while (p->next == WriteRequest::UNCONNECTED) {
@@ -1245,7 +1236,7 @@ bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
         p->next = tail;
         tail = p;
         p = saved_next;
-        CHECK(p != NULL);
+        CHECK(p != nullptr);
     } while (p != old_head);
 
     // Link old list with new list.
@@ -1295,8 +1286,8 @@ int Socket::Connect(const timespec* abstime,
         _ssl_state = SSL_OFF;
     }
     struct sockaddr_storage serv_addr;
-    socklen_t addr_size = 0;
-    if (butil::endpoint2sockaddr(remote_side(), &serv_addr, &addr_size) != 0) {
+    socklen_t serv_addr_size = 0;
+    if (butil::endpoint2sockaddr(remote_side(), &serv_addr, &serv_addr_size) != 0) {
         PLOG(ERROR) << "Fail to get sockaddr";
         return -1;
     }
@@ -1308,19 +1299,42 @@ int Socket::Connect(const timespec* abstime,
     CHECK_EQ(0, butil::make_close_on_exec(sockfd));
     // We need to do async connect (to manage the timeout by ourselves).
     CHECK_EQ(0, butil::make_non_blocking(sockfd));
-    
-    const int rc = ::connect(
-        sockfd, (struct sockaddr*)&serv_addr, addr_size);
+    // Socket buffer sizes need to be set before connect.
+    brpc::SetSocketBufferOptions(sockfd);
+    if (!_device_name.empty()) {
+#ifdef SO_BINDTODEVICE
+        if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE,
+                       _device_name.c_str(), _device_name.size()) < 0) {
+            PLOG(ERROR) << "Fail to set SO_BINDTODEVICE of fd=" << sockfd
+                        << " to device_name=" << _device_name;
+            return -1;
+        }
+#else
+        LOG(ERROR) << "SO_BINDTODEVICE (device_name=" << _device_name
+                   << ") is not supported on this platform";
+        return -1;
+#endif
+    }
+    // Use the configured endpoint, not the runtime endpoint from getsockname().
+    if (butil::is_endpoint_extended(_bind_local_side) || _bind_local_side.ip != butil::IP_ANY) {
+        struct sockaddr_storage cli_addr{};
+        socklen_t cli_addr_size = 0;
+        if (butil::endpoint2sockaddr(_bind_local_side, &cli_addr, &cli_addr_size) != 0) {
+            PLOG(ERROR) << "Fail to get client sockaddr";
+            return -1;
+        }
+        if (::bind(sockfd, (struct sockaddr*)&cli_addr, cli_addr_size) != 0) {
+            PLOG(ERROR) << "Fail to bind client socket";
+            return -1;
+        }
+    }
+    const int rc = ::connect(sockfd, (struct sockaddr*)&serv_addr, serv_addr_size);
     if (rc != 0 && errno != EINPROGRESS) {
         PLOG(WARNING) << "Fail to connect to " << remote_side();
         return -1;
     }
     if (on_connect) {
-        EpollOutRequest* req = new(std::nothrow) EpollOutRequest;
-        if (req == NULL) {
-            LOG(FATAL) << "Fail to new EpollOutRequest";
-            return -1;
-        }
+        EpollOutRequest* req = new EpollOutRequest;
         req->fd = sockfd;
         req->timer_id = 0;
         req->on_epollout_event = on_connect;
@@ -1331,7 +1345,7 @@ int Socket::Connect(const timespec* abstime,
         SocketOptions options;
         options.bthread_tag = _io_event.bthread_tag();
         options.user = req;
-        if (Socket::Create(options, &connect_id) != 0) {
+        if (Create(options, &connect_id) != 0) {
             LOG(FATAL) << "Fail to create Socket";
             delete req;
             return -1;
@@ -1340,7 +1354,7 @@ int Socket::Connect(const timespec* abstime,
         // `connect_id'. We hold an additional reference here to
         // ensure `req' to be valid in this scope
         SocketUniquePtr s;
-        CHECK_EQ(0, Socket::Address(connect_id, &s));
+        CHECK_EQ(0, Address(connect_id, &s));
 
         // Add `sockfd' into epoll so that `HandleEpollOutRequest' will
         // be called with `req' when epoll event reaches
@@ -1437,7 +1451,7 @@ int Socket::ConnectIfNot(const timespec* abstime, WriteRequest* req) {
 
 void Socket::WakeAsEpollOut() {
     _epollout_butex->fetch_add(1, butil::memory_order_release);
-    bthread::butex_wake_except(_epollout_butex, 0);
+    bthread::butex_wake_except(_epollout_butex, INVALID_BTHREAD);
 }
 
 int Socket::OnOutputEvent(void* user_data, uint32_t,
@@ -1448,13 +1462,13 @@ int Socket::OnOutputEvent(void* user_data, uint32_t,
     // added into epoll, these sockets miss the signal inside
     // `SetFailed' and therefore must be signalled here using
     // `AddressFailedAsWell' to prevent waiting forever
-    if (Socket::AddressFailedAsWell(id, &s) < 0) {
+    if (AddressFailedAsWell(id, &s) < 0) {
         // Ignore recycled sockets
         return -1;
     }
 
     EpollOutRequest* req = dynamic_cast<EpollOutRequest*>(s->user());
-    if (req != NULL) {
+    if (req != nullptr) {
         return s->HandleEpollOutRequest(0, req);
     }
     
@@ -1468,11 +1482,11 @@ int Socket::OnOutputEvent(void* user_data, uint32_t,
 void Socket::HandleEpollOutTimeout(void* arg) {
     SocketId id = (SocketId)arg;
     SocketUniquePtr s;
-    if (Socket::Address(id, &s) != 0) {
+    if (Address(id, &s) != 0) {
         return;
     }
     EpollOutRequest* req = dynamic_cast<EpollOutRequest*>(s->user());
-    if (req == NULL) {
+    if (req == nullptr) {
         LOG(FATAL) << "Impossible! SocketUser MUST be EpollOutRequest here";
         return;
     }
@@ -1503,8 +1517,10 @@ void Socket::AfterAppConnected(int err, void* data) {
         // requests are not setup yet. check the comment on Setup() in Write()
         req->Setup(s);
         bthread_t th;
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "KeepWrite");
         if (bthread_start_background(
-                &th, &BTHREAD_ATTR_NORMAL, KeepWrite, req) != 0) {
+                &th, &attr, KeepWrite, req) != 0) {
             PLOG(WARNING) << "Fail to start KeepWrite";
             KeepWrite(req);
         }
@@ -1532,7 +1548,7 @@ void Socket::AfterAppConnected(int err, void* data) {
 static void* RunClosure(void* arg) {
     google::protobuf::Closure* done = (google::protobuf::Closure*)arg;
     done->Run();
-    return NULL;
+    return nullptr;
 }
 
 int Socket::KeepWriteIfConnected(int fd, int err, void* data) {
@@ -1542,10 +1558,11 @@ int Socket::KeepWriteIfConnected(int fd, int err, void* data) {
         // Run ssl connect in a new bthread to avoid blocking
         // the current bthread (thus blocking the EventDispatcher)
         bthread_t th;
-        std::unique_ptr<google::protobuf::Closure> thrd_func(brpc::NewCallback(
-                Socket::CheckConnectedAndKeepWrite, fd, err, data));
-        if ((err = bthread_start_background(&th, &BTHREAD_ATTR_NORMAL,
-                                            RunClosure, thrd_func.get())) == 0) {
+        std::unique_ptr<google::protobuf::Closure> thrd_func(
+            NewCallback(CheckConnectedAndKeepWrite, fd, err, data));
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "CheckConnectedAndKeepWrite");
+        if ((err = bthread_start_background(&th, &attr, RunClosure, thrd_func.get())) == 0) {
             thrd_func.release();
             return 0;
         } else {
@@ -1561,7 +1578,7 @@ void Socket::CheckConnectedAndKeepWrite(int fd, int err, void* data) {
     butil::fd_guard sockfd(fd);
     WriteRequest* req = static_cast<WriteRequest*>(data);
     Socket* s = req->get_socket();
-    if (NULL == s->_conn) {
+    if (nullptr == s->_conn) {
         CHECK_GE(sockfd, 0);
     }
     if (err == 0 && s->CheckConnected(sockfd) == 0
@@ -1570,8 +1587,7 @@ void Socket::CheckConnectedAndKeepWrite(int fd, int err, void* data) {
             g_vars->channel_conn << 1;
         }
         if (s->_app_connect) {
-            s->_app_connect->StartConnect(req->get_socket(),
-                                          AfterAppConnected, req);
+            s->_app_connect->StartConnect(req->get_socket(), AfterAppConnected, req);
         } else {
             // Successfully created a connection
             AfterAppConnected(0, req);
@@ -1618,7 +1634,7 @@ int Socket::ConductError(bthread_id_t id_wait) {
 
 X509* Socket::GetPeerCertificate() const {
     if (ssl_state() != SSL_CONNECTED) {
-        return NULL;
+        return nullptr;
     }
     BAIDU_SCOPED_LOCK(_ssl_session_mutex);
     return SSL_get_peer_certificate(_ssl_session);
@@ -1629,7 +1645,10 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
     if (options_in) {
         opt = *options_in;
     }
-    if (data->empty()) {
+    // An auth write (opt.auth_flags != 0) may carry an empty data buffer: some
+    // protocols (e.g. mysql) read the server greeting first and send their real
+    // bytes from the connection-phase handler, not from `data` here.
+    if (data->empty() && !opt.auth_flags) {
         return SetError(opt.id_wait, EINVAL);
     }
     if (opt.pipelined_count > MAX_PIPELINED_COUNT) {
@@ -1655,7 +1674,7 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
 
     req->data.swap(*data);
     // Set `req->next' to UNCONNECTED so that the KeepWrite thread will
-    // wait until it points to a valid WriteRequest or NULL.
+    // wait until it points to a valid WriteRequest or nullptr.
     req->next = WriteRequest::UNCONNECTED;
     req->id_wait = opt.id_wait;
     req->clear_and_set_control_bits(opt.notify_on_success, opt.shutdown_write);
@@ -1692,7 +1711,7 @@ int Socket::Write(SocketMessagePtr<>& msg, const WriteOptions* options_in) {
     }
 
     // Set `req->next' to UNCONNECTED so that the KeepWrite thread will
-    // wait until it points to a valid WriteRequest or NULL.
+    // wait until it points to a valid WriteRequest or nullptr.
     req->next = WriteRequest::UNCONNECTED;
     req->id_wait = opt.id_wait;
     req->clear_and_set_control_bits(opt.notify_on_success, opt.shutdown_write);
@@ -1705,7 +1724,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     // Release fence makes sure the thread getting request sees *req
     WriteRequest* const prev_head =
         _write_head.exchange(req, butil::memory_order_release);
-    if (prev_head != NULL) {
+    if (prev_head != nullptr) {
         // Someone is writing to the fd. The KeepWrite thread may spin
         // until req->next to be non-UNCONNECTED. This process is not
         // lock-free, but the duration is so short(1~2 instructions,
@@ -1717,12 +1736,14 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
 
     int saved_errno = 0;
     bthread_t th;
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    bthread_attr_set_name(&attr, "KeepWrite");
     SocketUniquePtr ptr_for_keep_write;
     ssize_t nw = 0;
     int ret = 0;
 
     // We've got the right to write.
-    req->next = NULL;
+    req->next = nullptr;
 
     // Fast fail when write has been shutdown.
     if (_is_write_shutdown) {
@@ -1759,16 +1780,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
         butil::IOBuf* data_arr[1] = { &req->data };
         nw = _conn->CutMessageIntoFileDescriptor(fd(), data_arr, 1);
     } else {
-#if BRPC_WITH_RDMA
-        if (_rdma_ep && _rdma_state != RDMA_OFF) {
-            butil::IOBuf* data_arr[1] = { &req->data };
-            nw = _rdma_ep->CutFromIOBufList(data_arr, 1);
-        } else {
-#else
-        {
-#endif
-            nw = req->data.cut_into_file_descriptor(fd());
-        }
+        nw = _transport->CutFromIOBuf(&req->data);
     }
     if (nw < 0) {
         // RTMP may return EOVERCROWDED
@@ -1783,7 +1795,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
     } else {
         AddOutputBytes(nw);
     }
-    if (IsWriteComplete(req, true, NULL)) {
+    if (IsWriteComplete(req, true, nullptr)) {
         ReturnSuccessfulWriteRequest(req);
         return 0;
     }
@@ -1791,7 +1803,7 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
 KEEPWRITE_IN_BACKGROUND:
     ReAddress(&ptr_for_keep_write);
     req->set_socket(ptr_for_keep_write.release());
-    if (bthread_start_background(&th, &BTHREAD_ATTR_NORMAL,
+    if (bthread_start_background(&th, &attr,
                                  KeepWrite, req) != 0) {
         LOG(FATAL) << "Fail to start KeepWrite";
         KeepWrite(req);
@@ -1815,13 +1827,13 @@ void* Socket::KeepWrite(void* void_arg) {
     SocketUniquePtr s(req->get_socket());
 
     // When error occurs, spin until there's no more requests instead of
-    // returning directly otherwise _write_head is permantly non-NULL which
+    // returning directly otherwise _write_head is permantly non-nullptr which
     // makes later Write() abnormal.
-    WriteRequest* cur_tail = NULL;
+    WriteRequest* cur_tail = nullptr;
     do {
         // req was written, skip it.
         bool need_shutdown = false;
-        if (req->next != NULL && req->data.empty()) {
+        if (req->next != nullptr && req->data.empty()) {
             WriteRequest* const saved_req = req;
             need_shutdown = req->need_shutdown_write();
             req = req->next;
@@ -1845,7 +1857,7 @@ void* Socket::KeepWrite(void* void_arg) {
             s->AddOutputBytes(nw);
         }
         // Release WriteRequest until non-empty data, last request or shutdown write.
-        while (req->next != NULL && req->data.empty()) {
+        while (req->next != nullptr && req->data.empty()) {
             WriteRequest* const saved_req = req;
             need_shutdown = req->need_shutdown_write();
             req = req->next;
@@ -1869,50 +1881,15 @@ void* Socket::KeepWrite(void* void_arg) {
             // KeepWrite to check and setup pending WriteRequests periodically,
             // which may turn on _overcrowded to stop pending requests from
             // growing infinitely.
-            const timespec duetime =
-                butil::milliseconds_from_now(WAIT_EPOLLOUT_TIMEOUT_MS);
-#if BRPC_WITH_RDMA
-            if (s->_rdma_state == RDMA_ON) {
-                const int expected_val = s->_epollout_butex
-                    ->load(butil::memory_order_acquire);
-                CHECK(s->_rdma_ep != NULL);
-                if (!s->_rdma_ep->IsWritable()) {
-                    g_vars->nwaitepollout << 1;
-                    if (bthread::butex_wait(s->_epollout_butex,
-                            expected_val, &duetime) < 0) {
-                        if (errno != EAGAIN && errno != ETIMEDOUT) {
-                            const int saved_errno = errno;
-                            PLOG(WARNING) << "Fail to wait rdma window of " << *s;
-                            s->SetFailed(saved_errno, "Fail to wait rdma window of %s: %s",
-                                    s->description().c_str(), berror(saved_errno));
-                        }
-                        if (s->Failed()) {
-                            // NOTE:
-                            // Different from TCP, we cannot find the RDMA channel
-                            // failed by writing to it. Thus we must check if it
-                            // is already failed here.
-                            break;
-                        }
-                    }
-                }
-            } else {
-#else
-            {
-#endif
-                g_vars->nwaitepollout << 1;
-                bool pollin = (s->_on_edge_triggered_events != NULL);
-                const int rc = s->WaitEpollOut(s->fd(), pollin, &duetime);
-                if (rc < 0 && errno != ETIMEDOUT) {
-                    const int saved_errno = errno;
-                    PLOG(WARNING) << "Fail to wait epollout of " << *s;
-                    s->SetFailed(saved_errno, "Fail to wait epollout of %s: %s",
-                             s->description().c_str(), berror(saved_errno));
-                    break;
-                }
+            const timespec duetime = butil::milliseconds_from_now(WAIT_EPOLLOUT_TIMEOUT_MS);
+            bool pollin = s->_transport->HasOnEdgeTrigger();
+            int ret = s->_transport->WaitEpollOut(s->_epollout_butex, pollin, duetime);
+            if (ret == 1) {
+                break;
             }
         }
-        if (NULL == cur_tail) {
-            for (cur_tail = req; cur_tail->next != NULL;
+        if (nullptr == cur_tail) {
+            for (cur_tail = req; cur_tail->next != nullptr;
                  cur_tail = cur_tail->next);
         }
         // Return when there's no more WriteRequests and req is completely
@@ -1920,20 +1897,20 @@ void* Socket::KeepWrite(void* void_arg) {
         if (s->IsWriteComplete(cur_tail, (req == cur_tail), &cur_tail)) {
             CHECK_EQ(cur_tail, req);
             s->ReturnSuccessfulWriteRequest(req);
-            return NULL;
+            return nullptr;
         }
     } while (1);
 
     // Error occurred, release all requests until no new requests.
     s->ReleaseAllFailedWriteRequests(req);
-    return NULL;
+    return nullptr;
 }
 
 ssize_t Socket::DoWrite(WriteRequest* req) {
     // Group butil::IOBuf in the list into a batch array.
     butil::IOBuf* data_list[DATA_LIST_MAX];
     size_t ndata = 0;
-    for (WriteRequest* p = req; p != NULL && ndata < DATA_LIST_MAX;
+    for (WriteRequest* p = req; p != nullptr && ndata < DATA_LIST_MAX;
          p = p->next) {
         data_list[ndata++] = &p->data;
         if (p->need_shutdown_write()) {
@@ -1948,13 +1925,7 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
         if (_conn) {
             return _conn->CutMessageIntoFileDescriptor(fd(), data_list, ndata);
         } else {
-#if BRPC_WITH_RDMA
-            if (_rdma_ep && _rdma_state != RDMA_OFF) {
-                return _rdma_ep->CutFromIOBufList(data_list, ndata);
-            }
-#endif
-            return butil::IOBuf::cut_multiple_into_file_descriptor(
-                fd(), data_list, ndata);
+            return _transport->CutFromIOBufList(data_list, ndata);
         }
     }
 
@@ -2000,7 +1971,7 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
 }
 
 int Socket::SSLHandshake(int fd, bool server_mode) {
-    if (_ssl_ctx == NULL) {
+    if (_ssl_ctx == nullptr) {
         if (server_mode) {
             LOG(ERROR) << "Lack SSL configuration to handle SSL request";
             return -1;
@@ -2014,7 +1985,7 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
         SSL_free(_ssl_session);
     }
     _ssl_session = CreateSSLSession(_ssl_ctx->raw_ctx, id(), fd, server_mode);
-    if (_ssl_session == NULL) {
+    if (_ssl_session == nullptr) {
         LOG(ERROR) << "Fail to CreateSSLSession";
         return -1;
     }
@@ -2026,9 +1997,23 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
 
     _ssl_state = SSL_CONNECTING;
 
+    // Bound the handshake by a deadline; without it, a peer that completes
+    // the TCP handshake but never returns a TLS Hello (e.g. server not
+    // configured for SSL) would park this bthread on bthread_fd_wait
+    // forever. That bthread holds a Socket reference via WriteRequest, so
+    // the underlying fd would never be recycled and the connection would
+    // remain ESTABLISHED indefinitely.
+    const int handshake_timeout_ms = FLAGS_ssl_handshake_timeout_ms;
+    timespec abstime_storage;
+    const timespec* abstime = nullptr;
+    if (handshake_timeout_ms > 0) {
+        abstime_storage = butil::milliseconds_from_now(handshake_timeout_ms);
+        abstime = &abstime_storage;
+    }
+
     // Loop until SSL handshake has completed. For SSL_ERROR_WANT_READ/WRITE,
-    // we use bthread_fd_wait as polling mechanism instead of EventDispatcher
-    // as it may confuse the origin event processing code.
+    // we use bthread_fd_timedwait as polling mechanism instead of
+    // EventDispatcher as it may confuse the origin event processing code.
     while (true) {
         ERR_clear_error();
         int rc = SSL_do_handshake(_ssl_session);
@@ -2061,7 +2046,12 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
             }
 
             _ssl_state = SSL_CONNECTED;
-            AddBIOBuffer(_ssl_session, fd, FLAGS_ssl_bio_buffer_size);
+            // Adding a BIO layer requires calling BIO_flush manually after SSL_write,
+            // which could trigger EAGAIN for large packets. However, it's very tedious
+            // to handle EAGAIN from both SSL_write and BIO_flush under current implementation.
+            // Also, BIO is a bit outdated for modern TCP as it already contains buffering.
+            // We decide to disable BIO.
+            // AddBIOBuffer(_ssl_session, fd, FLAGS_ssl_bio_buffer_size);
             return 0;
         }
 
@@ -2069,20 +2059,32 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
         switch (ssl_error) {
         case SSL_ERROR_WANT_READ:
 #if defined(OS_LINUX)
-            if (bthread_fd_wait(fd, EPOLLIN) != 0) {
+            if (bthread_fd_timedwait(fd, EPOLLIN, abstime) != 0) {
 #elif defined(OS_MACOSX)
-            if (bthread_fd_wait(fd, EVFILT_READ) != 0) {
+            if (bthread_fd_timedwait(fd, EVFILT_READ, abstime) != 0) {
 #endif
+                if (errno == ETIMEDOUT) {
+                    LOG(WARNING) << "SSL handshake timed out after "
+                                 << handshake_timeout_ms
+                                 << "ms while waiting for peer data on fd="
+                                 << fd << " remote_side=" << _remote_side;
+                }
                 return -1;
             }
             break;
 
         case SSL_ERROR_WANT_WRITE:
 #if defined(OS_LINUX)
-            if (bthread_fd_wait(fd, EPOLLOUT) != 0) {
+            if (bthread_fd_timedwait(fd, EPOLLOUT, abstime) != 0) {
 #elif defined(OS_MACOSX)
-            if (bthread_fd_wait(fd, EVFILT_WRITE) != 0) {
+            if (bthread_fd_timedwait(fd, EVFILT_WRITE, abstime) != 0) {
 #endif
+                if (errno == ETIMEDOUT) {
+                    LOG(WARNING) << "SSL handshake timed out after "
+                                 << handshake_timeout_ms
+                                 << "ms while waiting to send on fd=" << fd
+                                 << " remote_side=" << _remote_side;
+                }
                 return -1;
             }
             break;
@@ -2104,7 +2106,7 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
     }
 }
 
-ssize_t Socket::DoRead(size_t size_hint) {
+ssize_t Socket::DoRead(butil::IOPortal* read_buf, size_t size_hint) {
     if (ssl_state() == SSL_UNKNOWN) {
         int error_code = 0;
         _ssl_state = DetectSSLState(fd(), &error_code);
@@ -2138,8 +2140,7 @@ ssize_t Socket::DoRead(size_t size_hint) {
             errno = ESSL;
             return -1;
         }
-        CHECK(_rdma_state == RDMA_OFF);
-        return _read_buf.append_from_file_descriptor(fd(), size_hint);
+        return read_buf->append_from_file_descriptor(fd(), size_hint);
     }
 
     CHECK_EQ(SSL_CONNECTED, ssl_state());
@@ -2147,7 +2148,7 @@ ssize_t Socket::DoRead(size_t size_hint) {
     ssize_t nr = 0;
     {
         BAIDU_SCOPED_LOCK(_ssl_session_mutex);
-        nr = _read_buf.append_from_SSL_channel(_ssl_session, &ssl_error, size_hint);
+        nr = read_buf->append_from_SSL_channel(_ssl_session, &ssl_error, size_hint);
     }
     switch (ssl_error) {
     case SSL_ERROR_NONE:  // `nr' > 0
@@ -2166,18 +2167,27 @@ ssize_t Socket::DoRead(size_t size_hint) {
     default: {
         const unsigned long e = ERR_get_error();
         if (nr == 0) {
-            // Socket EOF or SSL session EOF
+            if (ssl_error != SSL_ERROR_ZERO_RETURN) {
+                // Unexpected EOF without proper SSL shutdown (close_notify)
+                LOG(WARNING) << "Fail to read from ssl_fd=" << fd()
+                             << ": unexpected ssl_error=" << ssl_error;
+                errno = ESSL;
+                return -1;
+            }
+            // Clean SSL shutdown (close_notify received)
         } else if (e != 0) {
             LOG(WARNING) << "Fail to read from ssl_fd=" << fd()
                          << ": " << SSLError(e);
             errno = ESSL;
         } else {
+            int saved_errno = errno;
             // System error with corresponding errno set.
             bool is_fatal_error = (ssl_error != SSL_ERROR_ZERO_RETURN &&
                                    ssl_error != SSL_ERROR_SYSCALL) ||
-                                   BIO_fd_non_fatal_error(errno) != 0 ||
+                                   BIO_fd_non_fatal_error(saved_errno) != 0 ||
                                   nr < 0;
             PLOG_IF(WARNING, is_fatal_error) << "Fail to read from ssl_fd=" << fd();
+            errno = saved_errno;
         }
         break;
     }
@@ -2194,7 +2204,7 @@ int Socket::FightAuthentication(int* auth_error) {
         *auth_error = (int32_t)(flag_error & 0xFFFFFFFFul);
         return EINVAL;
     }
-    if (0 == bthread_id_trylock(_auth_id, NULL)) {
+    if (0 == bthread_id_trylock(_auth_id, nullptr)) {
         // Winner
         return 0;
     } else {
@@ -2222,14 +2232,20 @@ void Socket::SetAuthentication(int error_code) {
     }
 }
 
+bool Socket::IsAuthenticated() const {
+    const uint64_t flag_error =
+        _auth_flag_error.load(butil::memory_order_acquire);
+    return (flag_error & AUTH_FLAG) &&
+        (int32_t)(flag_error & 0xFFFFFFFFul) == 0;
+}
+
 AuthContext* Socket::mutable_auth_context() {
-    if (_auth_context != NULL) {
+    if (_auth_context != nullptr) {
         LOG(FATAL) << "Impossible! This function is supposed to be called "
               "only once when verification succeeds in server side";
-        return NULL;
+        return nullptr;
     }
-    _auth_context = new(std::nothrow) AuthContext();
-    CHECK(_auth_context);
+    _auth_context = new AuthContext();
     return _auth_context;
 }
 
@@ -2240,17 +2256,19 @@ int Socket::OnInputEvent(void* user_data, uint32_t events,
     if (Address(id, &s) < 0) {
         return -1;
     }
-    if (NULL == s->_on_edge_triggered_events) {
-        // Callback can be NULL when receiving error epoll events
+    if (!s->_transport->HasOnEdgeTrigger()) {
+        // Callback can be nullptr when receiving error epoll events
         // (Added into epoll by `WaitConnected')
         return 0;
     }
     if (s->fd() < 0) {
-#if defined(OS_LINUX)
-        CHECK(!(events & EPOLLIN)) << "epoll_events=" << events;
-#elif defined(OS_MACOSX)
-        CHECK((short)events != EVFILT_READ) << "kqueue filter=" << events;
-#endif
+        // The event is stale: the fd that it was reported on has been closed
+        // by `WaitAndReset` after the event dispatcher fetched the event but
+        // before the event was dispatched to here. `Address` succeeds again
+        // because a successful health check revived the Socket in between.
+        // There's nothing to read from a closed fd, just drop the event. The
+        // new fd (if any) is watched separately and reports its own events.
+        RPC_VLOG << "Ignore stale event on " << *s << ", events=" << events;
         return -1;
     }
 
@@ -2266,27 +2284,15 @@ int Socket::OnInputEvent(void* user_data, uint32_t events,
         // is just 1500~1700/s
         g_vars->neventthread << 1;
 
-        bthread_t tid;
         // transfer ownership as well, don't use s anymore!
         Socket* const p = s.release();
 
         bthread_attr_t attr = thread_attr;
         attr.keytable_pool = p->_keytable_pool;
         attr.tag = bthread_self_tag();
-        if (FLAGS_usercode_in_coroutine) {
-            ProcessEvent(p);
-#if BRPC_WITH_RDMA
-        } else if (rdma::FLAGS_rdma_edisp_unsched == false) {
-            auto rc = bthread_start_background(&tid, &attr, ProcessEvent, p);
-            if (rc != 0) {
-                LOG(FATAL) << "Fail to start ProcessEvent";
-                ProcessEvent(p);
-            }
-#endif
-        } else if (bthread_start_urgent(&tid, &attr, ProcessEvent, p) != 0) {
-            LOG(FATAL) << "Fail to start ProcessEvent";
-            ProcessEvent(p);
-        }
+        // Only event dispatcher thread has flag BTHREAD_GLOBAL_PRIORITY
+        attr.flags = attr.flags & (~BTHREAD_GLOBAL_PRIORITY);
+        p->_transport->ProcessEvent(attr);
     }
     return 0;
 }
@@ -2315,7 +2321,7 @@ ObjectPtr<T> ShowObject(const T* obj) { return ObjectPtr<T>(obj); }
 
 template <typename T>
 std::ostream& operator<<(std::ostream& os, const ObjectPtr<T>& obj) {
-    if (obj._obj != NULL) {
+    if (obj._obj != nullptr) {
         os << '(' << butil::class_name_str(*obj._obj) << "*)";
     }
     return os << obj._obj;
@@ -2323,7 +2329,7 @@ std::ostream& operator<<(std::ostream& os, const ObjectPtr<T>& obj) {
 
 void Socket::DebugSocket(std::ostream& os, SocketId id) {
     SocketUniquePtr ptr;
-    int ret = Socket::AddressFailedAsWell(id, &ptr);
+    int ret = AddressFailedAsWell(id, &ptr);
     if (ret < 0) {
         os << "SocketId=" << id << " is invalid or recycled";
         return;
@@ -2392,7 +2398,7 @@ void Socket::DebugSocket(std::ostream& os, SocketId id) {
        << "\nnevent=" << ptr->_nevent.load(butil::memory_order_relaxed)
        << "\nfd=" << fd
        << "\ntos=" << ptr->_tos
-       << "\nreset_fd_to_now=" << butil::gettimeofday_us() - ptr->_reset_fd_real_us << "us"
+       << "\nreset_fd_to_now=" << butil::cpuwide_time_us() - ptr->_reset_fd_real_us << "us"
        << "\nremote_side=" << ptr->_remote_side
        << "\nlocal_side=" << ptr->_local_side
        << "\non_et_events=" << (void*)ptr->_on_edge_triggered_events
@@ -2400,15 +2406,16 @@ void Socket::DebugSocket(std::ostream& os, SocketId id) {
        << "\nthis_id=" << ptr->id()
        << "\npreferred_index=" << preferred_index;
     InputMessenger* messenger = dynamic_cast<InputMessenger*>(ptr->user());
-    if (messenger != NULL) {
+    if (messenger != nullptr) {
         os << " (" << messenger->NameOfProtocol(preferred_index) << ')';
     }
     const int64_t cpuwide_now = butil::cpuwide_time_us();
+    InputMessengerProcessor& input_processor = ptr->fd_input_processor();
     os << "\nhc_count=" << ptr->_hc_count
-       << "\navg_input_msg_size=" << ptr->_avg_msg_size
+       << "\navg_input_msg_size=" << input_processor.avg_msg_size()
         // NOTE: We're assuming that butil::IOBuf.size() is thread-safe, it is now
         // however it's not guaranteed.
-       << "\nread_buf=" << ptr->_read_buf.size()
+       << "\nread_buf=" << input_processor.read_buf().size()
        << "\nlast_read_to_now=" << cpuwide_now - ptr->_last_readtime_us << "us"
        << "\nlast_write_to_now=" << cpuwide_now - ptr->_last_writetime_us << "us"
        << "\novercrowded=" << ptr->_overcrowded;
@@ -2588,12 +2595,12 @@ void Socket::DebugSocket(std::ostream& os, SocketId id) {
            << "\n}";
     }
 #endif
-#if BRPC_WITH_RDMA
-    if (ptr->_rdma_state == RDMA_ON && ptr->_rdma_ep) {
-        ptr->_rdma_ep->DebugInfo(os);
-    }
-#endif
-    { os << "\nbthread_tag=" << ptr->_io_event.bthread_tag(); }
+
+    os << "\nrdma={\n";
+    ptr->_transport->Debug(os);
+    os << "}\n";
+
+    os << "\nbthread_tag=" << ptr->_io_event.bthread_tag();
 }
 
 int Socket::CheckHealth() {
@@ -2602,7 +2609,7 @@ int Socket::CheckHealth() {
     }
     const timespec duetime =
         butil::milliseconds_from_now(_hc_option.health_check_timeout_ms);
-    const int connected_fd = Connect(&duetime, NULL, NULL);
+    const int connected_fd = Connect(&duetime, nullptr, nullptr);
     if (connected_fd >= 0) {
         ::close(connected_fd);
         return 0;
@@ -2616,7 +2623,7 @@ int Socket::AddStream(StreamId stream_id) {
         _stream_mutex.unlock();
         return -1;
     }
-    if (_stream_set == NULL) {
+    if (_stream_set == nullptr) {
         _stream_set = new std::set<StreamId>();
     }
     _stream_set->insert(stream_id);
@@ -2626,7 +2633,7 @@ int Socket::AddStream(StreamId stream_id) {
 
 int Socket::RemoveStream(StreamId stream_id) {
     _stream_mutex.lock();
-    if (_stream_set == NULL) {
+    if (_stream_set == nullptr) {
         _stream_mutex.unlock();
         CHECK(false) << "AddStream was not called";
         return -1;
@@ -2640,7 +2647,7 @@ void Socket::ResetAllStreams(int error_code, const std::string& error_text) {
     DCHECK(Failed());
     std::set<StreamId> saved_stream_set;
     _stream_mutex.lock();
-    if (_stream_set != NULL) {
+    if (_stream_set != nullptr) {
         // Not delete _stream_set because there are likely more streams added
         // after reviving if the Socket is still in use, or it is to be deleted in 
         // BeforeRecycled()
@@ -2773,10 +2780,10 @@ inline void SocketPool::ListSockets(std::vector<SocketId>* out, size_t max_count
 Socket::SharedPart* Socket::GetOrNewSharedPartSlower() {
     // Create _shared_part optimistically.
     SharedPart* shared_part = GetSharedPart();
-    if (shared_part == NULL) {
+    if (shared_part == nullptr) {
         shared_part = new SharedPart(id());
         shared_part->AddRefManually();
-        SharedPart* expected = NULL;
+        SharedPart* expected = nullptr;
         if (!_shared_part.compare_exchange_strong(
                 expected, shared_part, butil::memory_order_acq_rel)) {
             shared_part->RemoveRefManually();
@@ -2798,28 +2805,33 @@ void Socket::ShareStats(Socket* main_socket) {
 }
 
 int Socket::GetPooledSocket(SocketUniquePtr* pooled_socket) {
-    if (pooled_socket == NULL) {
+    if (pooled_socket == nullptr) {
         LOG(ERROR) << "pooled_socket is NULL";
         return -1;
     }
     SharedPart* main_sp = GetOrNewSharedPart();
-    if (main_sp == NULL) {
+    if (main_sp == nullptr) {
         LOG(ERROR) << "_shared_part is NULL";
         return -1;
     }
     // Create socket_pool optimistically.
     SocketPool* socket_pool = main_sp->socket_pool.load(butil::memory_order_consume);
-    if (socket_pool == NULL) {
+    if (socket_pool == nullptr) {
         SocketOptions opt;
         opt.remote_side = remote_side();
+        // Propagate the configured client binding (source IP + device) to
+        // pooled sub-sockets so that they keep the same binding policy.
+        opt.local_side = _bind_local_side;
+        opt.device_name = _device_name;
         opt.user = user();
         opt.on_edge_triggered_events = _on_edge_triggered_events;
+        opt.need_on_edge_trigger = _need_on_edge_trigger;
         opt.initial_ssl_ctx = _ssl_ctx;
         opt.keytable_pool = _keytable_pool;
         opt.app_connect = _app_connect;
-        opt.use_rdma =  (_rdma_ep) ? true : false;
+        opt.socket_mode = _socket_mode;
         socket_pool = new SocketPool(opt);
-        SocketPool* expected = NULL;
+        SocketPool* expected = nullptr;
         if (!main_sp->socket_pool.compare_exchange_strong(
                 expected, socket_pool, butil::memory_order_acq_rel)) {
             delete socket_pool;
@@ -2831,7 +2843,7 @@ int Socket::GetPooledSocket(SocketUniquePtr* pooled_socket) {
         return -1;
     }
     (*pooled_socket)->ShareStats(this);
-    CHECK((*pooled_socket)->parsing_context() == NULL)
+    CHECK((*pooled_socket)->parsing_context() == nullptr)
         << "context=" << (*pooled_socket)->parsing_context()
         << " is not NULL when " << *(*pooled_socket) << " is got from"
         " SocketPool, the protocol implementation is buggy";
@@ -2839,20 +2851,20 @@ int Socket::GetPooledSocket(SocketUniquePtr* pooled_socket) {
 }
 
 int Socket::ReturnToPool() {
-    SharedPart* sp = _shared_part.exchange(NULL, butil::memory_order_acquire);
-    if (sp == NULL) {
+    SharedPart* sp = _shared_part.exchange(nullptr, butil::memory_order_acquire);
+    if (sp == nullptr) {
         LOG(ERROR) << "_shared_part is NULL";
         SetFailed(EINVAL, "_shared_part is NULL");
         return -1;
     }
     SocketPool* pool = sp->socket_pool.load(butil::memory_order_consume);
-    if (pool == NULL) {
+    if (pool == nullptr) {
         LOG(ERROR) << "_shared_part->socket_pool is NULL";
         SetFailed(EINVAL, "_shared_part->socket_pool is NULL");
         sp->RemoveRefManually();
         return -1;
     }
-    CHECK(parsing_context() == NULL)
+    CHECK(parsing_context() == nullptr)
         << "context=" << parsing_context() << " is not released when "
         << *this << " is returned to SocketPool, the protocol "
         "implementation is buggy";
@@ -2872,8 +2884,8 @@ int Socket::ReturnToPool() {
 
 bool Socket::HasSocketPool() const {
     SharedPart* sp = GetSharedPart();
-    if (sp != NULL) {
-        return sp->socket_pool.load(butil::memory_order_consume) != NULL;
+    if (sp != nullptr) {
+        return sp->socket_pool.load(butil::memory_order_consume) != nullptr;
     }
     return false;
 }
@@ -2881,11 +2893,11 @@ bool Socket::HasSocketPool() const {
 void Socket::ListPooledSockets(std::vector<SocketId>* out, size_t max_count) {
     out->clear();
     SharedPart* sp = GetSharedPart();
-    if (sp == NULL) {
+    if (sp == nullptr) {
         return;
     }
     SocketPool* pool = sp->socket_pool.load(butil::memory_order_consume);
-    if (pool == NULL) {
+    if (pool == nullptr) {
         return;
     }
     pool->ListSockets(out, max_count);
@@ -2893,11 +2905,11 @@ void Socket::ListPooledSockets(std::vector<SocketId>* out, size_t max_count) {
 
 bool Socket::GetPooledSocketStats(int* numfree, int* numinflight) {
     SharedPart* sp = GetSharedPart();
-    if (sp == NULL) {
+    if (sp == nullptr) {
         return false;
     }
     SocketPool* pool = sp->socket_pool.load(butil::memory_order_consume);
-    if (pool == NULL) {
+    if (pool == nullptr) {
         return false;
     }
     *numfree = pool->_numfree.load(butil::memory_order_relaxed);
@@ -2906,21 +2918,26 @@ bool Socket::GetPooledSocketStats(int* numfree, int* numinflight) {
 }
     
 int Socket::GetShortSocket(SocketUniquePtr* short_socket) {
-    if (short_socket == NULL) {
+    if (short_socket == nullptr) {
         LOG(ERROR) << "short_socket is NULL";
         return -1;
     }
     SocketId id;
     SocketOptions opt;
     opt.remote_side = remote_side();
+    // Propagate the configured client binding (source IP + device) to short
+    // sub-sockets so that they keep the same binding policy.
+    opt.local_side = _bind_local_side;
+    opt.device_name = _device_name;
     opt.user = user();
     opt.on_edge_triggered_events = _on_edge_triggered_events;
+    opt.need_on_edge_trigger = _need_on_edge_trigger;
     opt.initial_ssl_ctx = _ssl_ctx;
     opt.keytable_pool = _keytable_pool;
     opt.app_connect = _app_connect;
-    opt.use_rdma =  (_rdma_ep) ? true : false;
+    opt.socket_mode = _socket_mode;
     if (get_client_side_messenger()->Create(opt, &id) != 0 ||
-        Socket::Address(id, short_socket) != 0) {
+        Address(id, short_socket) != 0) {
         return -1;
     }
     (*short_socket)->ShareStats(this);
@@ -2931,8 +2948,8 @@ int Socket::GetAgentSocket(SocketUniquePtr* out, bool (*checkfn)(Socket*)) {
     SocketId id = _agent_socket_id.load(butil::memory_order_relaxed);
     SocketUniquePtr tmp_sock;
     do {
-        if (Socket::Address(id, &tmp_sock) == 0) {
-            if (checkfn == NULL || checkfn(tmp_sock.get())) {
+        if (Address(id, &tmp_sock) == 0) {
+            if (checkfn == nullptr || checkfn(tmp_sock.get())) {
                 out->swap(tmp_sock);
                 return 0;
             }
@@ -2943,7 +2960,7 @@ int Socket::GetAgentSocket(SocketUniquePtr* out, bool (*checkfn)(Socket*)) {
                 LOG(ERROR) << "Fail to get short socket from " << *this;
                 return -1;
             }
-            if (checkfn == NULL || checkfn(tmp_sock.get())) {
+            if (checkfn == nullptr || checkfn(tmp_sock.get())) {
                 break;
             }
             tmp_sock->ReleaseAdditionalReference();
@@ -2972,7 +2989,7 @@ void Socket::GetStat(SocketStat* s) const {
     BAIDU_CASSERT(sizeof(WriteRequest) == 64, sizeof_write_request_is_64);
 
     SharedPart* sp = GetSharedPart();
-    if (sp != NULL && sp->extended_stat != NULL) {
+    if (sp != nullptr && sp->extended_stat != nullptr) {
         *s = *sp->extended_stat;
     } else {
         memset(s, 0, sizeof(*s));
@@ -3024,7 +3041,7 @@ void Socket::OnProgressiveReadCompleted() {
 }
 
 SocketSSLContext::SocketSSLContext()
-    : raw_ctx(NULL)
+    : raw_ctx(nullptr)
 {}
 
 SocketSSLContext::~SocketSSLContext() {

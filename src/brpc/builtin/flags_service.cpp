@@ -117,11 +117,11 @@ void FlagsService::set_value_page(Controller* cntl,
     const bool is_string = (info.type == "string");
     os << "<!DOCTYPE html><html><body>"
         "<form action='' method='get'>"
-        " Set `" << name << "' from ";
+        " Set `" << WebEscape(name) << "' from ";
     if (is_string) {
         os << '"';
     }
-    os << info.current_value;
+    os << WebEscape(info.current_value);
     if (is_string) {
         os << '"';
     }
@@ -146,7 +146,7 @@ void FlagsService::default_method(::google::protobuf::RpcController* cntl_base,
     cntl->http_response().set_content_type(
         use_html ? "text/html" : "text/plain");
 
-    if (value_str != NULL) {
+    if (value_str != nullptr) {
         // reload value if ?setvalue=VALUE is present.
         if (constraint.empty()) {
             cntl->SetFailed(ENOMETHOD, "Require gflag name");
@@ -177,9 +177,12 @@ void FlagsService::default_method(::google::protobuf::RpcController* cntl_base,
             return;
         }
         butil::IOBufBuilder os;
-        os << "Set `" << constraint << "' to " << *value_str;
         if (use_html) {
+            os << "Set `" << WebEscape(constraint) << "' to "
+               << WebEscape(*value_str);
             os << "<br><a href='/flags'>[back to flags]</a>";
+        } else {
+            os << "Set `" << constraint << "' to " << *value_str;
         }
         os.move_to(cntl->response_attachment());
         return;
@@ -189,7 +192,7 @@ void FlagsService::default_method(::google::protobuf::RpcController* cntl_base,
     std::vector<std::string> wildcards;
     std::set<std::string> exact;
     if (!constraint.empty()) {
-        for (butil::StringMultiSplitter sp(constraint.c_str(), ",;"); sp != NULL; ++sp) {
+        for (butil::StringMultiSplitter sp(constraint.c_str(), ",;"); sp != nullptr; ++sp) {
             std::string name(sp.field(), sp.length());
             if (name.find_first_of("$*") != std::string::npos) {
                 wildcards.push_back(name);

@@ -30,8 +30,6 @@
 
 namespace bvar {
 
-constexpr uint64_t MAX_LABELS_COUNT = 10;
-
 DECLARE_bool(bvar_abort_on_same_name);
 
 extern bool s_bvar_may_abort;
@@ -71,11 +69,8 @@ DEFINE_uint32(max_multi_dimension_stats_count, 20000, "Max stats count of a mult
 BUTIL_VALIDATE_GFLAG(max_multi_dimension_stats_count,
                      validator_max_multi_dimension_stats_count);
 
-class MVarEntry {
-public:
-    MVarEntry() : var(NULL) {}
-
-    MVariable* var;
+struct MVarEntry {
+    MVariableBase::SharedExposedRef ref;
 };
 
 typedef butil::FlatMap<std::string, MVarEntry> MVarMap;
@@ -87,14 +82,14 @@ struct MVarMapWithLock : public MVarMap {
         if (init(256) != 0) {
             LOG(WARNING) << "Fail to init";
         }
-        pthread_mutex_init(&mutex, NULL);
+        pthread_mutex_init(&mutex, nullptr);
     }
 };
 
 // We have to initialize global map on need because bvar is possibly used
 // before main().
 static pthread_once_t s_mvar_map_once = PTHREAD_ONCE_INIT;
-static MVarMapWithLock* s_mvar_map = NULL;
+static MVarMapWithLock* s_mvar_map = nullptr;
 
 static void init_mvar_map() {
     // It's probably slow to initialize all sub maps, but rpc often expose 
@@ -107,39 +102,42 @@ inline MVarMapWithLock& get_mvar_map() {
     return *s_mvar_map;
 }
 
-MVariable::MVariable(const std::list<std::string>& labels) {
-    _labels.assign(labels.begin(), labels.end());
-    size_t n = labels.size();
-    if (n > MAX_LABELS_COUNT) {
-        LOG(ERROR) << "Too many labels: " << n << " seen, overflow detected, max labels count: " << MAX_LABELS_COUNT;
-        _labels.resize(MAX_LABELS_COUNT);
-    }
+MVariableBase::~MVariableBase() {
+    CHECK(!hide()) << "Subclass of MVariableBase MUST call hide() manually in their "
+                      "dtors to avoid displaying a variable that is just destructing";
 }
 
-MVariable::~MVariable() {
-    CHECK(!hide()) << "Subclass of MVariable MUST call hide() manually in their"
-    " dtors to avoid displaying a variable that is just destructing";
-}
-
-std::string MVariable::get_description() {
+std::string MVariableBase::get_description() {
     std::ostringstream os;
     describe(os);
     return os.str();
 }
 
-int MVariable::describe_exposed(const std::string& name,
+int MVariableBase::describe_exposed(const std::string& name,
                                 std::ostream& os) {
     MVarMapWithLock& m = get_mvar_map();
-    BAIDU_SCOPED_LOCK(m.mutex);
-    MVarEntry* entry = m.seek(name);
-    if (entry == NULL) {
+    MVariableBase* var = nullptr;
+    SharedExposedRef ref;
+    {
+        BAIDU_SCOPED_LOCK(m.mutex);
+        MVarEntry* entry = m.seek(name);
+        if (entry == nullptr) {
+            return -1;
+        }
+        ref = entry->ref;
+        var = ref->acquire();
+    }
+    if (var == nullptr) {
         return -1;
     }
-    entry->var->describe(os);
+    // Call describe() outside the MVarMap lock to avoid deadlock when the user
+    // callback (e.g. Dumper) yields the bthread.
+    var->describe(os);
+    ref->release();
     return 0;
 }
 
-std::string MVariable::describe_exposed(const std::string& name) {
+std::string MVariableBase::describe_exposed(const std::string& name) {
     std::ostringstream oss;
     if (describe_exposed(name, oss) == 0) {
         return oss.str();
@@ -147,8 +145,8 @@ std::string MVariable::describe_exposed(const std::string& name) {
     return std::string();
 }
 
-int MVariable::expose_impl(const butil::StringPiece& prefix,
-                           const butil::StringPiece& name) {
+int MVariableBase::expose_impl(const butil::StringPiece& prefix,
+                               const butil::StringPiece& name) {
     if (name.empty()) {
         LOG(ERROR) << "Parameter[name] is empty";
         return -1;
@@ -160,8 +158,12 @@ int MVariable::expose_impl(const butil::StringPiece& prefix,
     // expose a variable more than once and calls to expose() are unlikely
     // to contend heavily.
 
-    // remove previous pointer from the map if needed.
+    // Remove previous exposure if needed (hide() waits for in-flight readers
+    // and invalidates `_ref`).
+    // Always start the new exposure with a fresh `_ref`,  because a previous
+    // hide() may have permanently hidden the old `_ref`.
     hide();
+    _ref = detail::make_exposed_ref(this);
     
     // Build the name.
     _name.clear();
@@ -175,7 +177,8 @@ int MVariable::expose_impl(const butil::StringPiece& prefix,
     to_underscored_name(&_name, name);
    
     if (count_exposed() > (size_t)FLAGS_bvar_max_multi_dimension_metric_number) {
-        LOG(ERROR) << "Too many metric seen, overflow detected, max metric count:" << FLAGS_bvar_max_multi_dimension_metric_number;
+        LOG(ERROR) << "Too many metric seen, overflow detected, max metric count:"
+                   << FLAGS_bvar_max_multi_dimension_metric_number;
         return -1;
     }
 
@@ -183,9 +186,9 @@ int MVariable::expose_impl(const butil::StringPiece& prefix,
     {
         BAIDU_SCOPED_LOCK(m.mutex);
         MVarEntry* entry = m.seek(_name);
-        if (entry == NULL) {
+        if (entry == nullptr) {
             entry = &m[_name];
-            entry->var = this;
+            entry->ref = _ref;
             return 0;
         }
     }
@@ -205,39 +208,48 @@ int MVariable::expose_impl(const butil::StringPiece& prefix,
     return 0;
 }
 
-bool MVariable::hide() {
+bool MVariableBase::hide() {
     if (_name.empty()) {
         return false;
     }
 
     MVarMapWithLock& m = get_mvar_map();
-    BAIDU_SCOPED_LOCK(m.mutex);
-    MVarEntry* entry = m.seek(_name);
-    if (entry) {
-        CHECK_EQ(1UL, m.erase(_name));
-    } else {
-        CHECK(false) << "`" << _name << "' must exist";
+    {
+        BAIDU_SCOPED_LOCK(m.mutex);
+        MVarEntry* entry = m.seek(_name);
+        if (entry) {
+            CHECK_EQ(1UL, m.erase(_name));
+        } else {
+            CHECK(false) << "`" << _name << "' must exist";
+        }
     }
     _name.clear();
+    // Remove previous exposure if needed (hide() waits for in-flight readers
+    // and invalidates `_ref`).
+    // Always start the new exposure with a fresh `_ref`,  because a previous
+    // hide() may have permanently hidden the old `_ref`.
+    if (_ref != nullptr) {
+        _ref->hide_and_wait();
+    }
     return true;
 }
 
 #ifdef UNIT_TEST
-void MVariable::hide_all() {
+void MVariableBase::hide_all() {
     MVarMapWithLock& m = get_mvar_map();
     BAIDU_SCOPED_LOCK(m.mutex);
     m.clear();
 }
 #endif // end UNIT_TEST
 
-size_t MVariable::count_exposed() {
+size_t MVariableBase::count_exposed() {
     MVarMapWithLock& m = get_mvar_map();
     BAIDU_SCOPED_LOCK(m.mutex);
     return m.size();
 }
 
-void MVariable::list_exposed(std::vector<std::string>* names) {
-    if (names == NULL) {
+void MVariableBase::list_exposed(std::vector<std::string>* names) {
+    if (names == nullptr) {
         return;
     }
 
@@ -251,9 +263,9 @@ void MVariable::list_exposed(std::vector<std::string>* names) {
     }
 }
 
-size_t MVariable::dump_exposed(Dumper* dumper, const DumpOptions* options) {
-    if (NULL == dumper) {
-        LOG(ERROR) << "Parameter[dumper] is NULL";
+size_t MVariableBase::dump_exposed(Dumper* dumper, const DumpOptions* options) {
+    if (nullptr == dumper) {
+        LOG(ERROR) << "Parameter[dumper] is nullptr";
         return -1;
     }
     DumpOptions opt;
@@ -264,17 +276,26 @@ size_t MVariable::dump_exposed(Dumper* dumper, const DumpOptions* options) {
     list_exposed(&mvars);
     size_t n = 0;
     for (auto& mvar : mvars) {
-        MVarMapWithLock& m = get_mvar_map();
-        BAIDU_SCOPED_LOCK(m.mutex);
-        MVarEntry* entry = m.seek(mvar);
-        if (entry) {
-            n += entry->var->dump(dumper, &opt);
+        MVariableBase* var = nullptr;
+        SharedExposedRef ref;
+        {
+            MVarMapWithLock& m = get_mvar_map();
+            BAIDU_SCOPED_LOCK(m.mutex);
+            MVarEntry* entry = m.seek(mvar);
+            if (entry) {
+                ref = entry->ref;
+                var = ref->acquire();
+            }
+        }
+        if (var != nullptr) {
+            // Call dump() outside the MVarMap lock to avoid deadlock when the dump()
+            // yields the bthread.
+            n += var->dump(dumper, &opt);
+            ref->release();
         }
         if (n > static_cast<size_t>(FLAGS_bvar_max_dump_multi_dimension_metric_number)) {
-            LOG(WARNING) << "truncated because of \
-                            exceed max dump multi dimension label number["
-                         << FLAGS_bvar_max_dump_multi_dimension_metric_number
-                         << "]";
+            LOG(WARNING) << "truncated because of exceed max dump multi dimension label number["
+                         << FLAGS_bvar_max_dump_multi_dimension_metric_number << "]";
             break;
         }
     }

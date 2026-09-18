@@ -26,6 +26,7 @@
 #include "butil/third_party/murmurhash3/murmurhash3.h"
 #include "butil/process_util.h"              // ReadCommandLine
 #include "brpc/server.h"
+#include "brpc/reloadable_flags.h"
 #include "brpc/builtin/common.h"
 
 namespace brpc {
@@ -33,15 +34,18 @@ namespace brpc {
 DEFINE_string(rpc_profiling_dir, "./rpc_data/profiling",
               "For storing profiling results.");
 
+DEFINE_int32(max_profiling_seconds, 300, "upper limit of running time of profilers");
+BRPC_VALIDATE_GFLAG(max_profiling_seconds, PositiveInteger);
+
 bool UseHTML(const HttpHeader& header) {
     const std::string* console = header.uri().GetQuery(CONSOLE_STR);
-    if (console != NULL) {
+    if (console != nullptr) {
         return atoi(console->c_str()) == 0;
     }
     // [curl header]
     // User-Agent: curl/7.12.1 (x86_64-redhat-linux-gnu) libcurl/7.12.1 ...
     const std::string* agent = header.GetHeader(USER_AGENT_STR);
-    if (agent == NULL) {  // use text when user-agent is absent
+    if (agent == nullptr) {  // use text when user-agent is absent
         return false;
     }
     return agent->find("curl/") == std::string::npos;
@@ -50,8 +54,8 @@ bool UseHTML(const HttpHeader& header) {
 // Written by Jack Handy
 // <A href="mailto:jakkhandy@hotmail.com">jakkhandy@hotmail.com</A>
 inline bool url_wildcmp(const char* wild, const char* str) {
-    const char* cp = NULL;
-    const char* mp = NULL;
+    const char* cp = nullptr;
+    const char* mp = nullptr;
 
     while (*str && *wild != '*') {
         if (*wild != *str && *wild != '$') {
@@ -384,7 +388,7 @@ const char* GetProgramChecksum() {
 bool SupportGzip(Controller* cntl) {
     const std::string* encodings =
         cntl->http_request().GetHeader("Accept-Encoding");
-    if (encodings == NULL) {
+    if (encodings == nullptr) {
         return false;
     }
     return encodings->find("gzip") != std::string::npos;

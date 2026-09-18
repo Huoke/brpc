@@ -69,8 +69,8 @@ public:
                 }
             }
             if (FLAGS_spin) {
-                int64_t end_time = butil::gettimeofday_us() + (int64_t)delay;
-                while (butil::gettimeofday_us() < end_time) {}
+                int64_t end_time = butil::cpuwide_time_us() + (int64_t)delay;
+                while (butil::cpuwide_time_us() < end_time) {}
             } else {
                 bthread_usleep((int64_t)delay);
             }
@@ -111,7 +111,7 @@ int main(int argc, char* argv[]) {
     butil::StringSplitter sp(FLAGS_sleep_us.c_str(), ',');
     std::vector<int64_t> sleep_list;
     for (; sp; ++sp) {
-        sleep_list.push_back(strtoll(sp.field(), NULL, 10));
+        sleep_list.push_back(strtoll(sp.field(), nullptr, 10));
     }
     if (sleep_list.empty()) {
         sleep_list.push_back(0);

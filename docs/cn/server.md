@@ -120,13 +120,13 @@ public:
     // Constructed with a closure which will be Run() inside dtor.
     explicit ClosureGuard(google::protobuf::Closure* done);
     
-    // Call Run() of internal closure if it's not NULL.
+    // Call Run() of internal closure if it's not nullptr.
     ~ClosureGuard();
  
-    // Call Run() of internal closure if it's not NULL and set it to `done'.
+    // Call Run() of internal closure if it's not nullptr and set it to `done'.
     void reset(google::protobuf::Closure* done);
  
-    // Set internal closure to NULL and return the one before set.
+    // Set internal closure to nullptr and return the one before set.
     google::protobuf::Closure* release();
 };
 ```
@@ -218,7 +218,7 @@ int Start(const char *ip_str, PortRange port_range, const ServerOptions *opt);  
 
 关于IPV6和Unix domain socket的使用，详见 [EndPoint](endpoint.md)。
 
-`options`为NULL时所有参数取默认值，如果你要使用非默认值，这么做就行了：
+`options`为nullptr时所有参数取默认值，如果你要使用非默认值，这么做就行了：
 
 ```c++
 brpc::ServerOptions options;  // 包含了默认值
@@ -377,6 +377,16 @@ Server.set_version(...)可以为server设置一个名称+版本，可通过/vers
 | Name                      | Value | Description                              | Defined At          |
 | ------------------------- | ----- | ---------------------------------------- | ------------------- |
 | log_idle_connection_close | false | Print log when an idle connection is closed | src/brpc/socket.cpp |
+
+## 限制服务端连接数
+
+设置`ServerOptions.max_connections`可以限制Server公共监听端口上的并发连接数。默认值为0，表示不限制。该端口上的所有协议和服务共享同一个上限，包括RPC、HTTP、Redis和内置服务，无需配置专用协议。
+
+Acceptor会在创建brpc Socket前预留连接名额，因此空闲连接和尚未完成TLS握手的连接也计入上限。超限连接会在协议解析或TLS认证前被直接关闭，不发送协议专用的错误响应。Socket回收时释放连接名额。
+
+通过`ServerOptions.internal_port`配置的内部监听端口不受限制，也不占用公共端口的连接名额，因此公共端口满载时，内部端口上的内置服务仍可访问。同一个业务Service注册到多个Server、监听多个端口时，各公共监听端口分别计数和限流；即使共享同一个Service对象，也不会合并连接数。`ServerStatistics.connection_count`包含公共和内部端口的连接总数，因此可能超过`max_connections`；`ServerStatistics.rejected_connection_count`记录公共端口因超限而拒绝的累计连接数。
+
+运行中的Server可以调用`Server::SetMaxConnections()`原子更新上限，也可以在以无限制值启动后动态开启限制。调高上限会影响后续连接准入；调低上限不会断开已有连接，公共端口的活跃连接数降到新上限以下后才会重新接受新连接。设置为0会关闭限制。Server未运行时该方法返回-1；该方法不会修改`options().max_connections`记录的启动值。每次`Start()`都使用该次传入选项中的上限。
 
 ## pid_file
 
@@ -559,7 +569,7 @@ public:
     virtual int VerifyCredential(const std::string& auth_str,
                                  const base::EndPoint& client_addr,
                                  AuthContext* out_ctx) const = 0;
-    }; 
+};
 
 class AuthContext {
 public:
@@ -573,7 +583,7 @@ public:
 
 server的验证是基于连接的。当server收到连接上的第一个请求时，会尝试解析出其中的身份信息部分（如baidu_std里的auth字段、HTTP协议里的Authorization头），然后附带client地址信息一起调用`VerifyCredential`。若返回0，表示验证成功，用户可以把验证后的信息填入`AuthContext`，后续可通过`controller->auth_context()`获取，用户不需要关心其分配和释放。否则表示验证失败，连接会被直接关闭，client访问失败。
 
-后续请求默认通过验证么，没有认证开销。
+后续请求默认通过验证，没有认证开销。
 
 把实现的`Authenticator`实例赋值到`ServerOptions.auth`，即开启验证功能，需要保证该实例在整个server运行周期内都有效，不能被析构。
 
@@ -675,7 +685,7 @@ server.MaxConcurrencyOf("example.EchoService.Echo") = "auto";
 
 pthread模式可以让一些老代码快速尝试brpc，但我们仍然建议逐渐地把代码改造为使用bthread local或最好不用TLS，从而最终能关闭这个开关。
 
-## 安全模式
+## 安全
 
 如果你的服务流量来自外部（包括经过nginx等转发），你需要注意一些安全因素：
 
@@ -686,8 +696,18 @@ pthread模式可以让一些老代码快速尝试brpc，但我们仍然建议逐
 - 设置内部端口。把ServerOptions.internal_port设为一个**仅允许内网访问**的端口。你可通过internal_port访问到内置服务，但通过对外端口(Server.Start时传入的那个)访问内置服务时将看到如下错误：
 
   ```
-  [a27eda84bcdeef529a76f22872b78305] Not allowed to access builtin services, try ServerOptions.internal_port=... instead if you're inside internal network
+  Not allowed to access builtin and Tabbed services, try ServerOptions.internal_port=... instead if you're in internal network
   ```
+
+  反过来，internal_port只提供内置服务(以及Tabbed服务)，普通服务的请求打到这个端口上会被拒绝：
+
+  ```
+  Only builtin and Tabbed services are accessible on ServerOptions.internal_port=..., send the request to the port passed to Server::Start() instead
+  ```
+
+  这是必须的：internal_port上的内置服务请求不需要通过ServerOptions.auth的鉴权，而鉴权结果是记在连接上的，一条连接只在第一个请求时鉴权一次。如果普通服务也在这个端口上提供，那么先发一个内置服务请求就能把整条连接标记为已鉴权，后续在同一条连接上访问普通服务将完全跳过鉴权。
+
+  有两类服务不走上面这条错误路径：ServerOptions.http_master_service和ServerOptions.baidu_master_service会接管所有URL和服务名(内置服务的也一样)，它们在internal_port上被直接忽略，请求回退到正常的服务查找，这样内置服务仍然可以从这个端口访问；ServerOptions.redis_service在解析阶段就把命令处理完了，没有Controller可以带回EPERM，因此internal_port上干脆不提供redis协议，连接会被直接关闭。
 
 - http proxy指定转发路径。nginx等可配置URL的映射关系，比如下面的配置把访问/MyAPI的外部流量映射到`target-server`的`/ServiceName/MethodName`。当外部流量尝试访问内置服务，比如说/status时，将直接被nginx拒绝。
 ```nginx
@@ -714,6 +734,10 @@ curl -s -m 1 <HOSTNAME>:<PORT>/flags/enable_dir_service,enable_threads_service |
 
 可以考虑对server地址做签名。比如在设置ServerOptions.internal_port后，server返回的错误信息中的IP信息是其MD5签名，而不是明文。
 
+### 不以root用户启动brpc进程
+
+由于brpc在运行过程中会写入各种文件（如server pid文件、rpcz、rpc dump、profiling等），如果brpc以root用户运行，攻击者可能利用这一特性进行文件的越权写入。因此，无论brpc是否对外提供网络服务，都不建议以root用户启动brpc进程。
+
 ## 定制/health页面
 
 /health页面默认返回"OK"，若需定制/health页面的内容：先继承[HealthReporter](https://github.com/apache/brpc/blob/master/src/brpc/health_reporter.h)，在其中实现生成页面的逻辑（就像实现其他http service那样），然后把实例赋给ServerOptions.health_reporter，这个实例不被server拥有，必须保证在server运行期间有效。用户在定制逻辑中可以根据业务的运行状态返回更多样的状态信息。
@@ -726,7 +750,7 @@ curl -s -m 1 <HOSTNAME>:<PORT>/flags/enable_dir_service,enable_threads_service |
 
 session-local data与一次server端RPC绑定: 从进入service回调开始，到调用server端的done结束，不管该service是同步还是异步处理。 session-local data会尽量被重用，在server停止前不会被删除。
 
-设置ServerOptions.session_local_data_factory后访问Controller.session_local_data()即可获得session-local数据。若没有设置，Controller.session_local_data()总是返回NULL。
+设置ServerOptions.session_local_data_factory后访问Controller.session_local_data()即可获得session-local数据。若没有设置，Controller.session_local_data()总是返回nullptr。
 
 若ServerOptions.reserved_session_local_data大于0，Server会在提供服务前就创建这么多个数据。
 
@@ -751,7 +775,7 @@ public:
         // Get the session-local data which is created by ServerOptions.session_local_data_factory
         // and reused between different RPC.
         MySessionLocalData* sd = static_cast<MySessionLocalData*>(cntl->session_local_data());
-        if (sd == NULL) {
+        if (sd == nullptr) {
             cntl->SetFailed("Require ServerOptions.session_local_data_factory to be set with a correctly implemented instance");
             return;
         }
@@ -762,9 +786,9 @@ public:
 struct ServerOptions {
     ...
     // The factory to create/destroy data attached to each RPC session.
-    // If this field is NULL, Controller::session_local_data() is always NULL.
+    // If this field is nullptr, Controller::session_local_data() is always nullptr.
     // NOT owned by Server and must be valid when Server is running.
-    // Default: NULL
+    // Default: nullptr
     const DataFactory* session_local_data_factory;
  
     // Prepare so many session-local data before server starts, so that calls
@@ -808,7 +832,7 @@ int main(int argc, char* argv[]) {
 
 server-thread-local与一次service回调绑定，从进service回调开始，到出service回调结束。所有的server-thread-local data会被尽量重用，在server停止前不会被删除。在实现上server-thread-local是一个特殊的bthread-local。
 
-设置ServerOptions.thread_local_data_factory后访问brpc::thread_local_data()即可获得thread-local数据。若没有设置，brpc::thread_local_data()总是返回NULL。
+设置ServerOptions.thread_local_data_factory后访问brpc::thread_local_data()即可获得thread-local数据。若没有设置，brpc::thread_local_data()总是返回nullptr。
 
 若ServerOptions.reserved_thread_local_data大于0，Server会在启动前就创建这么多个数据。
 
@@ -840,7 +864,7 @@ public:
         // and reused between different threads.
         // "tls" is short for "thread local storage".
         MyThreadLocalData* tls = static_cast<MyThreadLocalData*>(brpc::thread_local_data());
-        if (tls == NULL) {
+        if (tls == nullptr) {
             cntl->SetFailed("Require ServerOptions.thread_local_data_factory "
                             "to be set with a correctly implemented instance");
             return;
@@ -853,9 +877,9 @@ struct ServerOptions {
     ...    
     // The factory to create/destroy data attached to each searching thread
     // in server.
-    // If this field is NULL, brpc::thread_local_data() is always NULL.
+    // If this field is nullptr, brpc::thread_local_data() is always nullptr.
     // NOT owned by Server and must be valid when Server is running.
-    // Default: NULL
+    // Default: nullptr
     const DataFactory* thread_local_data_factory;
  
     // Prepare so many thread-local data before server starts, so that calls
@@ -908,9 +932,9 @@ Session-local和server-thread-local对大部分server已经够用。不过在一
 ```c++
 // Create a key value identifying a slot in a thread-specific data area.
 // Each thread maintains a distinct thread-specific data area.
-// `destructor', if non-NULL, is called with the value associated to that key
+// `destructor', if non-nullptr, is called with the value associated to that key
 // when the key is destroyed. `destructor' is not called if the value
-// associated is NULL when the key is destroyed.
+// associated is nullptr when the key is destroyed.
 // Returns 0 on success, error code otherwise.
 extern int bthread_key_create(bthread_key_t* key, void (*destructor)(void* data));
  
@@ -938,8 +962,8 @@ extern int bthread_key_delete(bthread_key_t key);
 extern int bthread_setspecific(bthread_key_t key, void* data);
  
 // Return current value of the thread-specific slot identified by `key'.
-// If bthread_setspecific() had not been called in the thread, return NULL.
-// If the key is invalid or deleted, return NULL.
+// If bthread_setspecific() had not been called in the thread, return nullptr.
+// If the key is invalid or deleted, return nullptr.
 extern void* bthread_getspecific(bthread_key_t key);
 ```
 
@@ -947,7 +971,7 @@ extern void* bthread_getspecific(bthread_key_t key);
 
 用bthread_key_create创建一个bthread_key_t，它代表一种bthread私有变量。
 
-用bthread_[get|set]specific查询和设置bthread私有变量。一个线程中第一次访问某个私有变量返回NULL。
+用bthread_[get|set]specific查询和设置bthread私有变量。一个线程中第一次访问某个私有变量返回nullptr。
 
 在所有线程都不使用和某个bthread_key_t相关的私有变量后再删除它。如果删除了一个仍在被使用的bthread_key_t，相关的私有变量就泄露了。
 
@@ -966,7 +990,7 @@ if (bthread_key_create(&tls_key, my_data_destructor) != 0) {
 ```c++
 // in some thread ...
 MyThreadLocalData* tls = static_cast<MyThreadLocalData*>(bthread_getspecific(tls_key));
-if (tls == NULL) {  // First call to bthread_getspecific (and before any bthread_setspecific) returns NULL
+if (tls == nullptr) {  // First call to bthread_getspecific (and before any bthread_setspecific) returns nullptr
     tls = new MyThreadLocalData;   // Create thread-local data on demand.
     CHECK_EQ(0, bthread_setspecific(tls_key, tls));  // set the data so that next time bthread_getspecific in the thread returns the data.
 }
@@ -1006,7 +1030,7 @@ public:
         //   pthread_getspecific -> bthread_getspecific
         //   pthread_setspecific -> bthread_setspecific
         MyThreadLocalData* tls2 = static_cast<MyThreadLocalData*>(bthread_getspecific(_tls2_key));
-        if (tls2 == NULL) {
+        if (tls2 == nullptr) {
             tls2 = new MyThreadLocalData;
             CHECK_EQ(0, bthread_setspecific(_tls2_key, tls2));
         }

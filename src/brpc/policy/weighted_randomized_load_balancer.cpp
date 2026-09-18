@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "butil/fast_rand.h"
+#include "bthread/prime_offset.h"
 #include "brpc/socket.h"
 #include "brpc/policy/weighted_randomized_load_balancer.h"
 #include "butil/strings/string_number_conversions.h"
@@ -116,10 +117,6 @@ size_t WeightedRandomizedLoadBalancer::RemoveServersInBatch(
     return _db_servers.Modify(BatchRemove, servers);
 }
 
-bool WeightedRandomizedLoadBalancer::IsServerAvailable(SocketId id, SocketUniquePtr* out) {
-    return Socket::Address(id, out) == 0 && (*out)->IsAvailable();
-}
-
 int WeightedRandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
     butil::DoublyBufferedData<Servers>::ScopedPtr s;
     if (_db_servers.Read(&s) != 0) {
@@ -134,50 +131,51 @@ int WeightedRandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
     uint64_t weight_sum = s->weight_sum;
     for (size_t i = 0; i < n; ++i) {
         uint64_t random_weight = butil::fast_rand_less_than(weight_sum);
+        // current_weight_sum is an inclusive prefix sum, so random_weight belongs
+        // to the first server whose prefix sum is strictly greater than it.
         const Server random_server(0, 0, random_weight);
         const auto& server =
-            std::lower_bound(s->server_list.begin(), s->server_list.end(),
+            std::upper_bound(s->server_list.begin(), s->server_list.end(),
                              random_server, server_compare);
         const SocketId id = server->id;
         if (ExcludedServers::IsExcluded(in.excluded, id)) {
             continue;
         }
         random_traversed.insert(id);
-        if (0 == IsServerAvailable(id, out->ptr)) {
+        if (IsServerAvailable(id, out->ptr)) {
             // An available server is found.
             return 0;
         }
     }
 
-    if (random_traversed.size() == n) {
+    if (random_traversed.size() < n) {
         // Try to traverse the remaining servers to find an available server.
         uint32_t offset = butil::fast_rand_less_than(n);
-        uint32_t stride = GenRandomStride();
+        uint32_t stride = bthread::prime_offset();
         for (size_t i = 0; i < n; ++i) {
             offset = (offset + stride) % n;
             SocketId id = s->server_list[offset].id;
-            if (NULL != random_traversed.seek(id)) {
+            if (nullptr != random_traversed.seek(id)) {
                 continue;
             }
             if (IsServerAvailable(id, out->ptr)) {
-                // An available server is found.
-                return 0;
+                if (!ExcludedServers::IsExcluded(in.excluded, id)) {
+                    // Prioritize servers that are not excluded.
+                    return 0;
+                }
             }
         }
     }
 
-    if (NULL != out->ptr) {
-        // Use the excluded but available server.
-        return 0;
-    }
-
-    // After traversing the whole server list, no available server is found.
-    return EHOSTDOWN;
+    // Returns EHOSTDOWN, if no available server is found
+    // after traversing the whole server list.
+    // Otherwise, returns 0 with a available excluded server.
+    return nullptr == out->ptr ? EHOSTDOWN : 0;
 }
 
 LoadBalancer* WeightedRandomizedLoadBalancer::New(
     const butil::StringPiece&) const {
-    return new (std::nothrow) WeightedRandomizedLoadBalancer;
+    return new WeightedRandomizedLoadBalancer;
 }
 
 void WeightedRandomizedLoadBalancer::Destroy() {

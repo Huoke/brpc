@@ -21,7 +21,7 @@
 #include <cstddef>
 #include <memory>
 #include <iostream>
-#include <set>
+#include <array>
 #include <string>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
@@ -59,11 +59,11 @@ static long start_perf_test_with_madder(size_t num_thread, bvar::Adder<uint64_t>
     EXPECT_TRUE(adder->valid());
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &thread_adder, (void *)adder);
+        pthread_create(&threads[i], nullptr, &thread_adder, (void *)adder);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
-        void *ret = NULL; 
+        void *ret = nullptr; 
         pthread_join(threads[i], &ret);
         totol_time += (long)ret;
     }
@@ -87,11 +87,11 @@ static long start_perf_test_with_mmaxer(size_t num_thread, bvar::Maxer<uint64_t>
     EXPECT_TRUE(maxer->valid());
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &thread_maxer, (void *)maxer);
+        pthread_create(&threads[i], nullptr, &thread_maxer, (void *)maxer);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
-        void *ret = NULL; 
+        void *ret = nullptr; 
         pthread_join(threads[i], &ret);
         totol_time += (long)ret;
     }
@@ -115,11 +115,11 @@ static long start_perf_test_with_mminer(size_t num_thread, bvar::Miner<uint64_t>
     EXPECT_TRUE(miner->valid());
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &thread_miner, (void *)miner);
+        pthread_create(&threads[i], nullptr, &thread_miner, (void *)miner);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
-        void *ret = NULL; 
+        void *ret = nullptr; 
         pthread_join(threads[i], &ret);
         totol_time += (long)ret;
     }
@@ -143,11 +143,11 @@ static long start_perf_test_with_mintrecorder(size_t num_thread, bvar::IntRecord
     EXPECT_TRUE(intrecorder->valid());
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &thread_intrecorder, (void *)intrecorder);
+        pthread_create(&threads[i], nullptr, &thread_intrecorder, (void *)intrecorder);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
-        void *ret = NULL; 
+        void *ret = nullptr; 
         pthread_join(threads[i], &ret);
         totol_time += (long)ret;
     }
@@ -495,5 +495,171 @@ TEST_F(MultiDimensionTest, test_hash) {
         << "hash_fun2 \t" << perf_hash(hash_fun2) << "\n"
         << "hash_fun3 \t" << perf_hash(hash_fun3) << "\n";
     LOG(INFO) << "Hash fun performance:\n" << oss.str();
+}
+
+
+class MyStringView {
+public:
+    MyStringView() : _ptr(nullptr), _len(0) {}
+    MyStringView(const char* str)
+        : _ptr(str),
+          _len(str == nullptr ? 0 : strlen(str)) {}
+#if __cplusplus >= 201703L
+    MyStringView(const std::string_view& str)
+        : _ptr(str.data()), _len(str.size()) {}
+#endif // __cplusplus >= 201703L
+    MyStringView(const std::string& str)
+        : _ptr(str.data()), _len(str.size()) {}
+    MyStringView(const char* offset, size_t len)
+        : _ptr(offset), _len(len) {}
+
+    const char* data() const { return _ptr; }
+    size_t size() const { return _len; }
+
+    // Converts to `std::basic_string`.
+    explicit operator std::string() const {
+        if (nullptr == _ptr) {
+            return {};
+        }
+        return {_ptr, size()};
+    }
+
+    // Converts to butil::StringPiece.
+    explicit operator butil::StringPiece() const {
+        if (nullptr == _ptr) {
+            return {};
+        }
+        return {_ptr, size()};
+    }
+
+private:
+    const char* _ptr;
+    size_t _len;
+};
+
+bool operator==(const MyStringView& x, const std::string& y) {
+    if (x.size() != y.size()) {
+        return false;
+    }
+
+    return butil::StringPiece::wordmemcmp(x.data(), y.data(), x.size()) == 0;
+}
+
+bool operator==(const std::string& x, const MyStringView& y) {
+    if (x.size() != y.size()) {
+        return false;
+    }
+
+    return butil::StringPiece::wordmemcmp(x.data(), y.data(), x.size()) == 0;
+}
+
+static int g_exposed_count = 0;
+
+template <typename KeyType, typename ValueType>
+static void TestLabels() {
+    std::string mbvar_name = butil::string_printf("my_madder_%d", g_exposed_count);
+    KeyType labels{"idc", "method", "status"};
+    bvar::MultiDimension<bvar::Adder<int>, KeyType> my_madder(mbvar_name, labels);
+    ASSERT_EQ(labels.size(), my_madder.count_labels());
+    ASSERT_STREQ(mbvar_name.c_str(), my_madder.name().c_str());
+    ASSERT_EQ(labels, my_madder.labels());
+
+    using ItemType = typename ValueType::value_type;
+    ValueType labels_value{ItemType("cv"), ItemType("post"), ItemType("200")};
+    bvar::Adder<int>* adder = my_madder.get_stats(labels_value);
+    ASSERT_NE(nullptr, adder);
+    ASSERT_TRUE(my_madder.has_stats(labels_value));
+    ASSERT_EQ((size_t)1, my_madder.count_stats());
+    {
+        // Compatible with old API.
+        bvar::Adder<int>* temp = my_madder.get_stats({"cv", "post", "200"});
+        ASSERT_EQ(adder, temp);
+    }
+    *adder << g_exposed_count;
+    ASSERT_EQ(g_exposed_count, adder->get_value());
+    my_madder.delete_stats(labels_value);
+    ASSERT_FALSE(my_madder.has_stats(labels_value));
+    ASSERT_EQ((size_t)0, my_madder.count_stats());
+}
+
+TEST_F(MultiDimensionTest, labels) {
+    TestLabels<std::list<std::string>, std::list<std::string>>();
+    TestLabels<std::list<std::string>, std::vector<std::string>>();
+    TestLabels<std::list<std::string>, std::array<std::string, 3>>();
+
+    TestLabels<std::vector<std::string>, std::list<std::string>>();
+    TestLabels<std::vector<std::string>, std::vector<std::string>>();
+    TestLabels<std::vector<std::string>, std::array<std::string, 3>>();
+
+#if __cplusplus >= 201703L
+    TestLabels<std::list<std::string>, std::list<std::string_view>>();
+    TestLabels<std::list<std::string>, std::vector<std::string_view>>();
+    TestLabels<std::list<std::string>, std::array<std::string_view, 3>>();
+#endif // __cplusplus >= 201703L
+
+    TestLabels<std::vector<std::string>, std::list<butil::StringPiece>>();
+    TestLabels<std::vector<std::string>, std::vector<butil::StringPiece>>();
+    TestLabels<std::vector<std::string>, std::array<butil::StringPiece, 3>>();
+
+    TestLabels<std::list<std::string>, std::list<MyStringView>>();
+    TestLabels<std::list<std::string>, std::vector<MyStringView>>();
+    TestLabels<std::list<std::string>, std::array<MyStringView, 3>>();
+
+    TestLabels<std::vector<std::string>, std::list<MyStringView>>();
+    TestLabels<std::vector<std::string>, std::vector<MyStringView>>();
+    TestLabels<std::vector<std::string>, std::array<MyStringView, 3>>();
+}
+
+std::array<const char*, 3> g_labels_value{"idc", "post", "200"};
+bool g_shared_stop = false;
+
+void* get_shared_adder_thread(void* arg) {
+    auto my_madder =
+        (bvar::MultiDimension<bvar::Adder<int>, std::vector<std::string>, true>*)arg;
+    while (!g_shared_stop) {
+        auto adder = my_madder->get_stats(g_labels_value);
+        EXPECT_NE(nullptr, adder);
+        *adder << 1;
+    }
+    return nullptr;
+}
+
+void* delete_shared_adder_thread(void* arg) {
+    auto my_madder =
+        (bvar::MultiDimension<bvar::Adder<int>, std::vector<std::string>, true>*)arg;
+    while (!g_shared_stop) {
+        my_madder->delete_stats(g_labels_value);
+    }
+    return nullptr;
+}
+
+TEST_F(MultiDimensionTest, shared) {
+    bvar::MultiDimension<bvar::Adder<int>, std::vector<std::string>, true> my_madder(
+        "my_adder", {"idc", "method", "status"});
+    std::shared_ptr<bvar::Adder<int>> adder = my_madder.get_stats(g_labels_value);
+    ASSERT_NE(nullptr, adder);
+    ASSERT_TRUE(my_madder.has_stats(g_labels_value));
+    ASSERT_EQ((size_t)1, my_madder.count_stats());
+
+    *adder << 1;
+    ASSERT_EQ(1, adder->get_value());
+    my_madder.delete_stats(g_labels_value);
+    *adder << 1;
+    ASSERT_EQ(2, adder->get_value());
+    ASSERT_FALSE(my_madder.has_stats(g_labels_value));
+
+    const int get_num = 8;
+    std::vector<pthread_t> get_threads(get_num);
+    for (int i = 0; i < get_num; ++i) {
+        ASSERT_EQ(0, pthread_create(&get_threads[i], nullptr, get_shared_adder_thread, &my_madder));
+    }
+    pthread_t delete_thread;
+    ASSERT_EQ(0, pthread_create(&delete_thread, nullptr, delete_shared_adder_thread, &my_madder));
+    usleep(100 * 1000); // 100ms
+    g_shared_stop = true;
+    for (int i = 0; i < get_num; ++i) {
+        ASSERT_EQ(0, pthread_join(get_threads[i], nullptr));
+    }
+    ASSERT_EQ(0, pthread_join(delete_thread, nullptr));
 }
 

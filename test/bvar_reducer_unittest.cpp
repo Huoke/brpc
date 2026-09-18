@@ -90,7 +90,7 @@ static long start_perf_test_with_atomic(size_t num_thread) {
     butil::atomic<uint64_t> counter(0);
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &add_atomic, (void *)&counter);
+        pthread_create(&threads[i], nullptr, &add_atomic, (void *)&counter);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
@@ -108,11 +108,11 @@ static long start_perf_test_with_adder(size_t num_thread) {
     EXPECT_TRUE(reducer.valid());
     pthread_t threads[num_thread];
     for (size_t i = 0; i < num_thread; ++i) {
-        pthread_create(&threads[i], NULL, &thread_counter, (void *)&reducer);
+        pthread_create(&threads[i], nullptr, &thread_counter, (void *)&reducer);
     }
     long totol_time = 0;
     for (size_t i = 0; i < num_thread; ++i) {
-        void *ret = NULL; 
+        void *ret = nullptr; 
         pthread_join(threads[i], &ret);
         totol_time += (long)ret;
     }
@@ -218,14 +218,14 @@ void ReducerTest_window() {
     const int N = 6000;
     int count = 0;
     int total_count = 0;
-    int64_t last_time = butil::gettimeofday_us();
+    int64_t last_time = butil::cpuwide_time_us();
     for (int i = 1; i <= N; ++i) {
         c1 << 1;
         c2 << N - i;
         c3 << i;
         ++count;
         ++total_count;
-        int64_t now = butil::gettimeofday_us();
+        int64_t now = butil::cpuwide_time_us();
         if (now - last_time >= 1000000L) {
             last_time = now;
             ASSERT_EQ(total_count, c1.get_value());
@@ -248,8 +248,8 @@ void ReducerTest_window() {
 }
 
 TEST_F(ReducerTest, window) {
-#if !BRPC_WITH_GLOG
     ReducerTest_window();
+#if !BRPC_WITH_GLOG
     logging::StringSink log_str;
     logging::LogSink* old_sink = logging::SetLogSink(&log_str);
     sleep(1);
@@ -308,13 +308,13 @@ TEST_F(ReducerTest, non_primitive_mt) {
     pthread_t th[8];
     g_stop = false;
     for (size_t i = 0; i < arraysize(th); ++i) {
-        pthread_create(&th[i], NULL, string_appender, &cater);
+        pthread_create(&th[i], nullptr, string_appender, &cater);
     }
     usleep(50000);
     g_stop = true;
     butil::hash_map<pthread_t, int> appended_count;
     for (size_t i = 0; i < arraysize(th); ++i) {
-        StringAppenderResult* res = NULL;
+        StringAppenderResult* res = nullptr;
         pthread_join(th[i], (void**)&res);
         appended_count[th[i]] = res->count;
         delete res;
@@ -322,7 +322,7 @@ TEST_F(ReducerTest, non_primitive_mt) {
     butil::hash_map<pthread_t, int> got_count;
     std::string res = cater.get_value();
     for (butil::StringSplitter sp(res.c_str(), '.'); sp; ++sp) {
-        char* endptr = NULL;
+        char* endptr = nullptr;
         ++got_count[(pthread_t)strtoll(sp.field(), &endptr, 10)];
         ASSERT_EQ(27LL, sp.field() + sp.length() - endptr)
             << butil::StringPiece(sp.field(), sp.length());

@@ -56,7 +56,7 @@ public:
 
     // You can copy a URI.
     URI();
-    ~URI();
+    ~URI() = default;
 
     // Exchange internal fields with another URI.
     void Swap(URI &rhs);
@@ -99,11 +99,12 @@ public:
     void set_port(int port) { _port = port; }
     void SetHostAndPort(const std::string& host_and_optional_port);
     // Set path/query/fragment with the input in form of "path?query#fragment"
-    void SetH2Path(const char* h2_path);
-    void SetH2Path(const std::string& path) { SetH2Path(path.c_str()); }
+    // Returns 0 on success, -1 otherwise and status() is set.
+    int SetH2Path(const char* h2_path);
+    int SetH2Path(const std::string& path) { return SetH2Path(path.c_str()); }
     
     // Get the value of a CASE-SENSITIVE key.
-    // Returns pointer to the value, NULL when the key does not exist.
+    // Returns pointer to the value, nullptr when the key does not exist.
     const std::string* GetQuery(const char* key) const
     { return get_query_map().seek(key); }
     const std::string* GetQuery(const std::string& key) const
@@ -157,7 +158,7 @@ friend class HttpMessage;
     mutable QueryMap _query_map;
 };
 
-// Parse host/port/scheme from `url' if the corresponding parameter is not NULL.
+// Parse host/port/scheme from `url' if the corresponding parameter is not nullptr.
 // Returns 0 on success, -1 otherwise.
 int ParseURL(const char* url, std::string* scheme, std::string* host, int* port);
 

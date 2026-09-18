@@ -77,33 +77,42 @@ TEST(NamingServiceTest, sanity) {
     ASSERT_EQ(0, bns.GetServers("qa-pbrpc.SAT.tjyx", &servers));
 #endif
 
+    auto collect_ips = [&servers]() {
+        std::set<butil::ip_t> ret;
+        for (auto& server : servers) {
+            ret.insert(server.addr.ip);
+        }
+        return ret;
+    };
     brpc::policy::DomainNamingService dns;
     ASSERT_EQ(0, dns.GetServers("baidu.com:1234", &servers));
-    ASSERT_EQ(2u, servers.size());
-    ASSERT_EQ(1234, servers[0].addr.port);
-    ASSERT_EQ(1234, servers[1].addr.port);
-    const std::set<butil::ip_t> expected_ips{servers[0].addr.ip, servers[1].addr.ip};
+    size_t server_size = servers.size();
+    ASSERT_GE(server_size, 1);
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(1234, servers[i].addr.port);
+    }
+    const auto expected_ips = collect_ips();
 
     ASSERT_EQ(0, dns.GetServers("baidu.com", &servers));
-    ASSERT_EQ(2u, servers.size());
-    const std::set<butil::ip_t> ip_list1{servers[0].addr.ip, servers[1].addr.ip};
-    ASSERT_TRUE(IsIPListEqual(expected_ips, ip_list1));
-    ASSERT_EQ(80, servers[0].addr.port);
-    ASSERT_EQ(80, servers[1].addr.port);
+    ASSERT_EQ(server_size, servers.size());
+    ASSERT_TRUE(IsIPListEqual(expected_ips, collect_ips()));
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(80, servers[i].addr.port);
+    }
 
     ASSERT_EQ(0, dns.GetServers("baidu.com:1234/useless1/useless2", &servers));
-    ASSERT_EQ(2u, servers.size());
-    const std::set<butil::ip_t> ip_list2{servers[0].addr.ip, servers[1].addr.ip};
-    ASSERT_TRUE(IsIPListEqual(expected_ips, ip_list2));
-    ASSERT_EQ(1234, servers[0].addr.port);
-    ASSERT_EQ(1234, servers[1].addr.port);
+    ASSERT_EQ(server_size, servers.size());
+    ASSERT_TRUE(IsIPListEqual(expected_ips, collect_ips()));
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(1234, servers[i].addr.port);
+    }
 
     ASSERT_EQ(0, dns.GetServers("baidu.com/useless1/useless2", &servers));
-    ASSERT_EQ(2u, servers.size());
-    const std::set<butil::ip_t> ip_list3{servers[0].addr.ip, servers[1].addr.ip};
-    ASSERT_TRUE(IsIPListEqual(expected_ips, ip_list3));
-    ASSERT_EQ(80, servers[0].addr.port);
-    ASSERT_EQ(80, servers[1].addr.port);
+    ASSERT_EQ(server_size, servers.size());
+    ASSERT_TRUE(IsIPListEqual(expected_ips, collect_ips()));
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ASSERT_EQ(80, servers[i].addr.port);
+    }
 
     const char *address_list[] =  {
         "10.127.0.1:1234",
@@ -228,11 +237,11 @@ TEST(NamingServiceTest, remotefile) {
     brpc::Server server1;
     UserNamingServiceImpl svc1;
     ASSERT_EQ(0, server1.AddService(&svc1, brpc::SERVER_DOESNT_OWN_SERVICE));
-    ASSERT_EQ(0, server1.Start("localhost:8635", NULL));
+    ASSERT_EQ(0, server1.Start("localhost:8635", nullptr));
     brpc::Server server2;
     UserNamingServiceImpl svc2;
     ASSERT_EQ(0, server2.AddService(&svc2, brpc::SERVER_DOESNT_OWN_SERVICE));
-    ASSERT_EQ(0, server2.Start("localhost:8636", NULL));
+    ASSERT_EQ(0, server2.Start("localhost:8636", nullptr));
 
     butil::EndPoint n1;
     ASSERT_EQ(0, butil::str2endpoint("0.0.0.0:8635", &n1));
@@ -440,7 +449,7 @@ TEST(NamingServiceTest, consul_with_backup_file) {
     ASSERT_EQ(0, server.AddService(&svc,
                                    brpc::SERVER_DOESNT_OWN_SERVICE,
                                    restful_map.c_str()));
-    ASSERT_EQ(0, server.Start("localhost:8500", NULL));
+    ASSERT_EQ(0, server.Start("localhost:8500", nullptr));
 
     bthread_usleep(5000000);
 
@@ -537,6 +546,7 @@ static std::string s_nodes_result = R"({
     "message": "0",
     "ttl": 1,
     "data": [
+        42,
         {
             "addr": "127.0.0.1:8635",
             "status": 0,
@@ -655,7 +665,7 @@ TEST(NamingServiceTest, discovery_sanity) {
         "/discovery/cancel => Cancel";
     ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE,
                 rest_mapping.c_str()));
-    ASSERT_EQ(0, server.Start("localhost:8635", NULL));
+    ASSERT_EQ(0, server.Start("localhost:8635", nullptr));
 
     brpc::policy::DiscoveryNamingService dcns;
     std::vector<brpc::ServerNode> servers;

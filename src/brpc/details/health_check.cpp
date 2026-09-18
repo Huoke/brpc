@@ -99,9 +99,9 @@ void* HealthCheckManager::AppCheck(void* arg) {
     done->cntl.Reset();
     done->cntl.http_request().uri() = done->hc_option.health_check_path;
     ControllerPrivateAccessor(&done->cntl).set_health_check_call();
-    done->last_check_time_ms = butil::gettimeofday_ms();
-    done->channel.CallMethod(NULL, &done->cntl, NULL, NULL, done);
-    return NULL;
+    done->last_check_time_ms = butil::cpuwide_time_ms();
+    done->channel.CallMethod(nullptr, &done->cntl, nullptr, nullptr, done);
+    return nullptr;
 }
 
 void OnAppHealthCheckDone::Run() {
@@ -126,7 +126,7 @@ void OnAppHealthCheckDone::Run() {
         << ", " << cntl.ErrorText();
 
     int64_t sleep_time_ms =
-        last_check_time_ms + interval_s * 1000 - butil::gettimeofday_ms();
+        last_check_time_ms + interval_s * 1000 - butil::cpuwide_time_ms();
     if (sleep_time_ms > 0) {
         // TODO(zhujiashun): we need to handle the case when timer fails
         // and bthread_usleep returns immediately. In most situations,
@@ -183,15 +183,14 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
         _first_time = false;
         if (ptr->WaitAndReset(2/*note*/) != 0) {
             LOG(INFO) << "Cancel checking " << *ptr;
-            ptr->AfterHCCompleted();
             return false;
         }
     }
 
-    // g_vars must not be NULL because it is newed at the creation of
+    // g_vars must not be nullptr because it is newed at the creation of
     // first Socket. When g_vars is used, the socket is at health-checking
     // state, which means the socket must be created and then g_vars can
-    // not be NULL.
+    // not be nullptr.
     g_vars->nhealthcheck << 1;
     int hc = 0;
     if (ptr->_user) {
@@ -210,11 +209,9 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
         if (!ptr->health_check_path().empty()) {
             HealthCheckManager::StartCheck(_id, ptr->_health_check_interval_s);
         }
-        ptr->AfterHCCompleted();
         return false;
     } else if (hc == ESTOP) {
         LOG(INFO) << "Cancel checking " << *ptr;
-        ptr->AfterHCCompleted();
         return false;
     } else {
         RPC_VLOG << "Fail to check " << *ptr

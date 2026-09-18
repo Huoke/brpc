@@ -45,6 +45,7 @@
 #include "brpc/concurrency_limiter.h"
 #include "brpc/baidu_master_service.h"
 #include "brpc/rpc_pb_message_factory.h"
+#include "brpc/socket_mode.h"
 
 namespace brpc {
 
@@ -73,12 +74,12 @@ struct ServerOptions {
 
     // Process requests in format of nshead_t + blob.
     // Owned by Server and deleted in server's destructor.
-    // Default: NULL
+    // Default: nullptr
     NsheadService* nshead_service;
 
     // Process requests in format of thrift_binary_head_t + blob.
     // Owned by Server and deleted in server's destructor.
-    // Default: NULL
+    // Default: nullptr
     ThriftService* thrift_service;
 
     // Adaptor for Mongo protocol, check src/brpc/mongo_service_adaptor.h for details
@@ -86,8 +87,8 @@ struct ServerOptions {
     // and must remain valid when server is running.
     const MongoServiceAdaptor* mongo_service_adaptor;
 
-    // Turn on authentication for all services if `auth' is not NULL.
-    // Default: NULL
+    // Turn on authentication for all services if `auth' is not nullptr.
+    // Default: nullptr
     const Authenticator* auth;
 
     // false: `auth' is not owned by server and must be valid when server is running.
@@ -95,8 +96,8 @@ struct ServerOptions {
     // Default: false
     bool server_owns_auth;
 
-    // Turn on request interception  if `interceptor' is not NULL.
-    // Default: NULL
+    // Turn on request interception  if `interceptor' is not nullptr.
+    // Default: nullptr
     const Interceptor* interceptor;
 
     // false: `interceptor' is not owned by server and must be valid when server is running.
@@ -131,6 +132,17 @@ struct ServerOptions {
     // Default: 0 (unlimited)
     int max_concurrency;
 
+    // Maximum number of simultaneous connections on the public listener,
+    // shared by all protocols and services, including builtin services.
+    // Idle connections and connections awaiting TLS handshakes count too.
+    // Excess connections are closed before protocol parsing or TLS, without
+    // a response. The internal listener has a separate, unlimited count.
+    // Other Server instances have independent limits, even if they share
+    // the same service object on different ports.
+    // Use Server::SetMaxConnections() to update the limit at runtime.
+    // Default: 0 (unlimited)
+    size_t max_connections;
+
     // Default value of method-level max concurrencies,
     // Overridable by Server.MaxConcurrencyOf().
     AdaptiveMaxConcurrency method_max_concurrency;
@@ -157,9 +169,9 @@ struct ServerOptions {
     //   session-local data or thread-local data is definitely not a good design.
 
     // The factory to create/destroy data attached to each RPC session.
-    // If this option is NULL, Controller::session_local_data() is always NULL.
+    // If this option is nullptr, Controller::session_local_data() is always nullptr.
     // NOT owned by Server and must be valid when Server is running.
-    // Default: NULL
+    // Default: nullptr
     const DataFactory* session_local_data_factory;
 
     // Prepare so many session-local data before server starts, so that calls
@@ -172,9 +184,9 @@ struct ServerOptions {
 
     // The factory to create/destroy data attached to each searching thread
     // in server.
-    // If this option is NULL, brpc::thread_local_data() is always NULL.
+    // If this option is nullptr, brpc::thread_local_data() is always nullptr.
     // NOT owned by Server and must be valid when Server is running.
-    // Default: NULL
+    // Default: nullptr
     const DataFactory* thread_local_data_factory;
 
     // Prepare so many thread-local data before server starts, so that calls
@@ -189,8 +201,8 @@ struct ServerOptions {
     // bthreads before server runs, mainly for initializing bthread locals.
     // You have to set both `bthread_init_fn' and `bthread_init_count' to
     // enable the feature.
-    bool (*bthread_init_fn)(void* args); // default: NULL (do nothing)
-    void* bthread_init_args;             // default: NULL
+    bool (*bthread_init_fn)(void* args); // default: nullptr (do nothing)
+    void* bthread_init_args;             // default: nullptr
     size_t bthread_init_count;           // default: 0
 
     // Provide builtin services at this port rather than the port to Start().
@@ -201,6 +213,9 @@ struct ServerOptions {
     // hiding them from public. Setting this option also enables security
     // protection code which we may add constantly.
     // Update: this option affects Tabbed services as well.
+    // Update: this port carries builtin and Tabbed services only, requests
+    // for ordinary services are rejected with EPERM and must be sent to the
+    // port passed to Start().
     // Default: -1
     int internal_port;
 
@@ -216,16 +231,16 @@ struct ServerOptions {
     bool security_mode() const { return internal_port >= 0 || !has_builtin_services; }
 
     // SSL related options. Refer to `ServerSSLOptions' for details
-    bool has_ssl_options() const { return _ssl_options != NULL; }
+    bool has_ssl_options() const { return _ssl_options != nullptr; }
     const ServerSSLOptions& ssl_options() const { return *_ssl_options; }
     ServerSSLOptions* mutable_ssl_options();
 
     // Force ssl for all connections of the port to Start().
     bool force_ssl;
 
-    // Whether the server uses rdma or not
-    // Default: false
-    bool use_rdma;
+    // Transport used by accepted sockets.
+    // Default: SOCKET_MODE_TCP
+    SocketMode socket_mode;
 
     // [CAUTION] This option is for implementing specialized baidu-std proxies,
     // most users don't need it. Don't change this option unless you fully
@@ -254,11 +269,15 @@ struct ServerOptions {
     HealthReporter* health_reporter;
 
     // For processing RTMP connections. Read src/brpc/rtmp.h for details.
-    // Default: NULL (rtmp support disabled)
+    // Default: nullptr (rtmp support disabled)
     RtmpService* rtmp_service;
 
     // Only enable these protocols, separated by spaces.
     // All names inside must be valid, check protocols name in global.cpp
+    // http/h2 and rdma_handshake are served whatever this field says:
+    // the builtin services are only reachable over http/h2, and
+    // rdma_handshake is a transport level handshake dispatching no request.
+    // Naming them here is allowed and changes nothing.
     // Default: empty (all protocols)
     std::string enabled_protocols;
 
@@ -267,7 +286,7 @@ struct ServerOptions {
 
     // For processing Redis connections. Read src/brpc/redis.h for details.
     // Owned by Server and deleted in server's destructor.
-    // Default: NULL (disabled)
+    // Default: nullptr (disabled)
     RedisService* redis_service;
 
     // Optional info name for composing server bvar prefix. Read ServerPrefix() method for details;
@@ -301,7 +320,10 @@ private:
 // This struct is originally designed to contain basic statistics of the
 // server. But bvar contains more stats and is more convenient.
 struct ServerStatistics {
+    // Total connections on the public and internal listeners.
     size_t connection_count;
+    // Cumulative connections rejected by the public listener's limit.
+    size_t rejected_connection_count;
     int user_service_count;
     int builtin_service_count;
 };
@@ -382,7 +404,7 @@ public:
         bool is_builtin_service;
         ServiceOwnership ownership;
         // `service' and `restful_map' are mutual exclusive, they can't be
-        // both non-NULL. If `restful_map' is not NULL, the URL should be
+        // both non-nullptr. If `restful_map' is not nullptr, the URL should be
         // further matched by it.
         google::protobuf::Service* service;
         RestfulMap* restful_map;
@@ -391,7 +413,7 @@ public:
             return !is_builtin_service && !restful_map;
         }
 
-        const std::string& service_name() const;
+        const std::string service_name() const;
     };
     typedef butil::FlatMap<std::string, ServiceProperty> ServiceMap;
 
@@ -410,7 +432,7 @@ public:
             OpaqueParams();
         };
         OpaqueParams params;
-        // NULL if service of the method was never added as restful.
+        // nullptr if service of the method was never added as restful.
         // "@path1 @path2 ..." if the method was mapped from paths.
         std::string* http_url;
         google::protobuf::Service* service;
@@ -434,7 +456,7 @@ public:
 
         ThreadLocalOptions()
             : tls_key(INVALID_BTHREAD_KEY)
-            , thread_local_data_factory(NULL) {}
+            , thread_local_data_factory(nullptr) {}
     };
 
 public:
@@ -444,7 +466,7 @@ public:
     // A set of functions to start this server.
     // Returns 0 on success, -1 otherwise and errno is set appropriately.
     // Notes:
-    // * Default options are taken if `opt' is NULL.
+    // * Default options are taken if `opt' is nullptr.
     // * A server can be started more than once if the server is completely
     //   stopped by Stop() and Join().
     // * port can be 0, which makes kernel to choose a port dynamically.
@@ -519,14 +541,14 @@ public:
     int ResetCertificates(const std::vector<CertInfo>& certs);
 
     // Find a service by its ServiceDescriptor::full_name().
-    // Returns the registered service pointer, NULL on not found.
+    // Returns the registered service pointer, nullptr on not found.
     // Notice that for performance concerns, this function does not lock service
     // list internally thus races with AddService()/RemoveService().
     google::protobuf::Service*
     FindServiceByFullName(const butil::StringPiece& full_name) const;
 
     // Find a service by its ServiceDescriptor::name().
-    // Returns the registered service pointer, NULL on not found.
+    // Returns the registered service pointer, nullptr on not found.
     // Notice that for performance concerns, this function does not lock service
     // list internally thus races with AddService()/RemoveService().
     google::protobuf::Service*
@@ -537,6 +559,13 @@ public:
 
     // Get statistics of this server
     void GetStat(ServerStatistics* stat) const;
+
+    // Atomically update the connection limit of the running public listener.
+    // Existing connections are not closed when the limit is lowered.
+    // Set to 0 to disable the limit. Does not change options().max_connections,
+    // which records the startup setting.
+    // Returns 0 on success, -1 if this Server is not running.
+    int SetMaxConnections(size_t max_connections);
 
     // Get the options passed to Start().
     const ServerOptions& options() const { return _options; }
@@ -549,7 +578,7 @@ public:
 
     // Return the first service added to this server. If a service was once
     // returned by first_service() and then removed, first_service() will
-    // always be NULL.
+    // always be nullptr.
     // This is useful for some production lines whose protocol does not
     // contain a service name, in which case this service works as the
     // default service.
@@ -714,12 +743,12 @@ friend class Controller;
 
     template <typename T>
     int SetServiceMaxConcurrency(T* service) {
-        if (NULL != service) {
+        if (nullptr != service && nullptr != service->_status) {
             const AdaptiveMaxConcurrency* amc = &service->_max_concurrency;
-            if (amc->type() == AdaptiveMaxConcurrency::UNLIMITED) {
+            if (amc->type() == AdaptiveMaxConcurrency::UNLIMITED()) {
                 amc = &_options.method_max_concurrency;
             }
-            ConcurrencyLimiter* cl = NULL;
+            ConcurrencyLimiter* cl = nullptr;
             if (!CreateConcurrencyLimiter(*amc, &cl)) {
                 LOG(ERROR) << "Fail to create ConcurrencyLimiter for method";
                 return -1;
@@ -754,7 +783,7 @@ friend class Controller;
     // uses service->name() to designate an RPC service
     ServiceMap _service_map;
 
-    // The only non-builtin service in _service_map, otherwise NULL.
+    // The only non-builtin service in _service_map, otherwise nullptr.
     google::protobuf::Service* _first_service;
 
     // Store TabInfo of services inheriting Tabbed.
@@ -798,8 +827,8 @@ friend class Controller;
 
 // Get the data attached to current searching thread. The data is created by
 // ServerOptions.thread_local_data_factory and reused between different threads.
-// If ServerOptions.thread_local_data_factory is NULL, return NULL.
-// If this function is not called inside a server thread, return NULL.
+// If ServerOptions.thread_local_data_factory is nullptr, return nullptr.
+// If this function is not called inside a server thread, return nullptr.
 void* thread_local_data();
 
 // Test if a dummy server was already started.

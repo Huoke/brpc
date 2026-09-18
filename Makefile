@@ -44,6 +44,10 @@ ifeq ($(shell test $(GCC_VERSION) -ge 40400; echo $$?),0)
     CXXFLAGS+=-msse4 -msse4.2
   endif
 endif
+# RISC-V specific optimizations
+ifeq ($(shell uname -m),riscv64)
+  CXXFLAGS+=-march=rv64gc
+endif
 #not solved yet
 ifeq ($(CC),gcc)
   ifeq ($(shell test $(GCC_VERSION) -ge 70000; echo $$?),0)
@@ -118,6 +122,7 @@ BUTIL_SOURCES = \
     src/butil/strings/string_number_conversions.cc \
     src/butil/strings/string_split.cc \
     src/butil/strings/string_piece.cc \
+    src/butil/string_compare_rvv.cc \
     src/butil/strings/string_util.cc \
     src/butil/strings/string_util_constants.cc \
     src/butil/strings/stringprintf.cc \
@@ -163,6 +168,7 @@ BUTIL_SOURCES = \
     src/butil/crc32c.cc \
     src/butil/containers/case_ignored_flat_map.cpp \
     src/butil/iobuf.cpp \
+    src/butil/single_iobuf.cpp \
     src/butil/iobuf_profiler.cpp \
     src/butil/binary_printer.cpp \
     src/butil/recordio.cc \
@@ -197,10 +203,16 @@ JSON2PB_DIRS = src/json2pb
 JSON2PB_SOURCES = $(foreach d,$(JSON2PB_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
 JSON2PB_OBJS = $(addsuffix .o, $(basename $(JSON2PB_SOURCES))) 
 
-BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/rdma
+BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/policy/mysql src/brpc/rdma
+ifeq ($(WITH_URMA),1)
+BRPC_DIRS += src/brpc/urma
+endif
 THRIFT_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/thrift*,$(SRCEXTS))))
 EXCLUDE_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/event_dispatcher_*,$(SRCEXTS))))
 BRPC_SOURCES_ALL = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
+ifeq ($(URMA_USE_MOCK),0)
+BRPC_SOURCES_ALL := $(filter-out src/brpc/urma/mock_urma.cpp,$(BRPC_SOURCES_ALL))
+endif
 BRPC_SOURCES = $(filter-out $(THRIFT_SOURCES) $(EXCLUDE_SOURCES), $(BRPC_SOURCES_ALL))
 BRPC_PROTOS = $(filter %.proto,$(BRPC_SOURCES))
 BRPC_CFAMILIES = $(filter-out %.proto %.pb.cc,$(BRPC_SOURCES))

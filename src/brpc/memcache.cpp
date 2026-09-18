@@ -17,6 +17,7 @@
 
 #include "brpc/memcache.h"
 
+#include <google/protobuf/io/coded_stream.h>
 #include "brpc/policy/memcache_binary_header.h"
 #include "brpc/proto_base.pb.h"
 #include "butil/logging.h"
@@ -64,7 +65,7 @@ bool MemcacheRequest::MergePartialFromCodedStream(
     
     // simple approach just making it work.
     butil::IOBuf tmp;
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (input->GetDirectBufferPointer(&data, &size)) {
         tmp.append(data, size);
@@ -76,7 +77,7 @@ bool MemcacheRequest::MergePartialFromCodedStream(
         char aux_buf[sizeof(policy::MemcacheRequestHeader)];
         const policy::MemcacheRequestHeader* header =
             (const policy::MemcacheRequestHeader*)tmp.fetch(aux_buf, sizeof(aux_buf));
-        if (header == NULL) {
+        if (header == nullptr) {
             return false;
         }
         if (header->magic != (uint8_t)policy::MC_MAGIC_REQUEST) {
@@ -99,7 +100,7 @@ void MemcacheRequest::SerializeWithCachedSizes(
 
     // simple approach just making it work.
     butil::IOBufAsZeroCopyInputStream wrapper(_buf);
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (wrapper.Next(&data, &size)) {
         output->WriteRaw(data, size);
@@ -171,7 +172,7 @@ bool MemcacheResponse::MergePartialFromCodedStream(
     LOG(WARNING) << "You're not supposed to parse a MemcacheResponse";
 
     // simple approach just making it work.
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (input->GetDirectBufferPointer(&data, &size)) {
         _buf.append(data, size);
@@ -186,7 +187,7 @@ void MemcacheResponse::SerializeWithCachedSizes(
     
     // simple approach just making it work.
     butil::IOBufAsZeroCopyInputStream wrapper(_buf);
-    const void* data = NULL;
+    const void* data = nullptr;
     int size = 0;
     while (wrapper.Next(&data, &size)) {
         output->WriteRaw(data, size);
@@ -422,10 +423,10 @@ bool MemcacheResponse::PopGet(
 // MUST NOT have key
 // MUST NOT have value
 bool MemcacheResponse::PopDelete() {
-    return PopStore(policy::MC_BINARY_DELETE, NULL);
+    return PopStore(policy::MC_BINARY_DELETE, nullptr);
 }
 bool MemcacheResponse::PopFlush() {
-    return PopStore(policy::MC_BINARY_FLUSH, NULL);
+    return PopStore(policy::MC_BINARY_FLUSH, nullptr);
 }
 
 struct StoreHeaderWithExtras {
@@ -500,6 +501,13 @@ bool MemcacheResponse::PopStore(uint8_t command, uint64_t* cas_value) {
     LOG_IF(ERROR, header.key_length != 0) << "STORE response must not have key";
     int value_size = (int)header.total_body_length - (int)header.extras_length
         - (int)header.key_length;
+    if (value_size < 0) {
+        // extras_length + key_length overrun the declared body. Drop exactly the
+        // declared message so that following pipelined responses stay aligned.
+        _buf.pop_front(sizeof(header) + header.total_body_length);
+        butil::string_printf(&_err, "value_size=%d is negative", value_size);
+        return false;
+    }
     if (header.status != (uint16_t)STATUS_SUCCESS) {
         _buf.pop_front(sizeof(header) + header.extras_length + header.key_length);
         _err.clear();

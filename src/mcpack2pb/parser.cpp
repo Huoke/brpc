@@ -122,7 +122,7 @@ void ObjectIterator::operator++() {
         if (!_current_field.name.empty()) {
             _current_field.name.remove_suffix(1);
         }
-        _current_field.value.set((FieldType)head.type(), _stream, head.value_size());
+        _current_field.value.set((FieldType)head.type(), _stream, head.value_size(), _depth);
     } else if (first_byte & FIELD_SHORT_MASK) {
         FieldShortHead head;
         if (_stream->cut_packed_pod(&head) != sizeof(FieldShortHead) ||
@@ -143,7 +143,7 @@ void ObjectIterator::operator++() {
         if (!_current_field.name.empty()) {
             _current_field.name.remove_suffix(1);
         }
-        _current_field.value.set(type, _stream, head.value_size());
+        _current_field.value.set(type, _stream, head.value_size(), _depth);
     } else {
         FieldLongHead head;
         if (_stream->cut_packed_pod(&head) != sizeof(FieldLongHead) ||
@@ -162,7 +162,7 @@ void ObjectIterator::operator++() {
         if (!_current_field.name.empty()) {
             _current_field.name.remove_suffix(1);
         }
-        _current_field.value.set((FieldType)head.type(), _stream, head.value_size());
+        _current_field.value.set((FieldType)head.type(), _stream, head.value_size(), _depth);
     }
 }
 
@@ -206,7 +206,7 @@ void ArrayIterator::operator++() {
         if (name_size) {
             _stream->popn(name_size);
         }
-        _current_field.set((FieldType)head.type(), _stream, head.value_size());
+        _current_field.set((FieldType)head.type(), _stream, head.value_size(), _depth);
     } else if (first_byte & FIELD_SHORT_MASK) {
         FieldShortHead head;
         if (_stream->cut_packed_pod(&head) != sizeof(FieldShortHead) ||
@@ -227,7 +227,7 @@ void ArrayIterator::operator++() {
         if (name_size) {
             _stream->popn(name_size);
         }
-        _current_field.set(type, _stream, head.value_size());
+        _current_field.set(type, _stream, head.value_size(), _depth);
     } else {
         FieldLongHead head;
         if (_stream->cut_packed_pod(&head) != sizeof(FieldLongHead) ||
@@ -246,7 +246,7 @@ void ArrayIterator::operator++() {
         if (name_size) {
             _stream->popn(name_size);
         }
-        _current_field.set((FieldType)head.type(), _stream, head.value_size());
+        _current_field.set((FieldType)head.type(), _stream, head.value_size(), _depth);
     }
 }
 
@@ -577,6 +577,15 @@ double UnparsedValue::as_double(const char* var) {
 }
 
 void UnparsedValue::as_string(std::string* out, const char* var) {
+    if (_size < 1) {
+        // A string field must contain at least the trailing '\0'.
+        // Reject _size == 0 here, otherwise `_size - 1' underflows and
+        // resize() throws an uncaught exception. Clear `out' so callers
+        // that reuse the string do not keep a stale value.
+        out->clear();
+        _stream->set_bad();
+        return;
+    }
     out->resize(_size - 1);
     if (_stream->cutn(&(*out)[0], _size - 1) != _size - 1) {
         CHECK(false) << "Not enough data for " << var;

@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 namespace {
+#if !WITH_BABYLON_COUNTER
 TEST(RecorderTest, test_complement) {
     LOG(INFO) << "sizeof(LatencyRecorder)=" << sizeof(bvar::LatencyRecorder)
               << " " << sizeof(bvar::detail::Percentile)
@@ -61,6 +62,7 @@ TEST(RecorderTest, test_compress_negtive_number) {
         ASSERT_EQ(a, bvar::IntRecorder::_extend_sign_bit(bvar::IntRecorder::_get_sum(compressed)));
     }
 }
+#endif // !WITH_BABYLON_COUNTER
 
 TEST(RecorderTest, sanity) {
     {
@@ -70,13 +72,18 @@ TEST(RecorderTest, sanity) {
         for (size_t i = 0; i < 100; ++i) {
             recorder << 2;
         }
-        ASSERT_EQ(2l, (int64_t)recorder.average());
+        ASSERT_EQ(2l, recorder.average());
         ASSERT_EQ("2", bvar::Variable::describe_exposed("var1"));
         std::vector<std::string> vars;
         bvar::Variable::list_exposed(&vars);
         ASSERT_EQ(1UL, vars.size());
         ASSERT_EQ("var1", vars[0]);
         ASSERT_EQ(1UL, bvar::Variable::count_exposed());
+    }
+    {
+        bvar::IntRecorder recorder("var2");
+        recorder << 2;
+        ASSERT_EQ(2l, recorder.average());
     }
     ASSERT_EQ(0UL, bvar::Variable::count_exposed());
 }
@@ -89,10 +96,10 @@ TEST(RecorderTest, window) {
     bvar::Window<bvar::IntRecorder> w3(&c1, 3);
 
     const int N = 10000;
-    int64_t last_time = butil::gettimeofday_us();
+    int64_t last_time = butil::cpuwide_time_us();
     for (int i = 1; i <= N; ++i) {
         c1 << i;
-        int64_t now = butil::gettimeofday_us();
+        int64_t now = butil::cpuwide_time_us();
         if (now - last_time >= 1000000L) {
             last_time = now;
             LOG(INFO) << "c1=" << c1 << " w1=" << w1 << " w2=" << w2 << " w3=" << w3;
@@ -193,7 +200,7 @@ TEST(RecorderTest, perf) {
     ASSERT_TRUE(recorder.valid());
     pthread_t threads[8];
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
-        pthread_create(&threads[i], NULL, &thread_counter, (void *)&recorder);
+        pthread_create(&threads[i], nullptr, &thread_counter, (void *)&recorder);
     }
     long totol_time = 0;
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
@@ -243,7 +250,7 @@ TEST(RecorderTest, latency_recorder_qps_accuracy) {
     ASSERT_GT(0.1, read(lr4, 1/2.0));
 
     ASSERT_GT(0.1, read(lr1, 10/3.0, 3));
-    ASSERT_GT(0.2, read(lr2, 11/3.0, 3));
+    ASSERT_GT(0.1, read(lr2, 11/3.0, 3));
     ASSERT_GT(0.1, read(lr3, 3/3.0, 3));
     ASSERT_GT(0.1, read(lr4, 1/3.0, 3));
 }

@@ -28,6 +28,7 @@
 #include "bthread/types.h"           // bthread_attr_t
 #include "bthread/stack.h"           // ContextualStack
 #include "bthread/timer_thread.h"
+#include "butil/thread_local.h"
 
 namespace bthread {
 
@@ -43,12 +44,18 @@ struct ButexWaiter;
 struct LocalStorage {
     KeyTable* keytable;
     void* assigned_data;
-    void* rpcz_parent_span;
+    void* rpcz_parent_span;  // Points to std::weak_ptr<brpc::Span>* (managed by brpc)
 };
 
-#define BTHREAD_LOCAL_STORAGE_INITIALIZER { NULL, NULL, NULL }
+#define BTHREAD_LOCAL_STORAGE_INITIALIZER { nullptr, nullptr, nullptr }
 
 const static LocalStorage LOCAL_STORAGE_INIT = BTHREAD_LOCAL_STORAGE_INITIALIZER;
+
+EXTERN_BAIDU_VOLATILE_THREAD_LOCAL(LocalStorage, tls_bls);
+
+inline LocalStorage* tls_bls_ptr() {
+    return BAIDU_GET_PTR_VOLATILE_THREAD_LOCAL(tls_bls);
+}
 
 enum TaskStatus {
     TASK_STATUS_UNKNOWN,
@@ -63,7 +70,7 @@ enum TaskStatus {
 
 struct TaskMeta {
     // [Not Reset]
-    butil::atomic<ButexWaiter*> current_waiter{NULL};
+    butil::atomic<ButexWaiter*> current_waiter{nullptr};
     uint64_t current_sleep{TimerThread::INVALID_TASK_ID};
 
     // A flag to mark if the Timer scheduling failed.
@@ -78,22 +85,32 @@ struct TaskMeta {
     // Scheduling of the thread can be delayed.
     bool about_to_quit{false};
     
-    // [Not Reset] guarantee visibility of version_butex.
+    // [Not Reset] Serializes the version bump at bthread end (in task_runner)
+    // with accessors that validate the version before touching other fields of
+    // this TaskMeta (get_attr/set_stopped/interrupt/set_butex_waiter/...). It
+    // makes their "check version then read/write field" sequence atomic w.r.t.
+    // the bump, so they never operate on a slot that got recycled in between.
     pthread_spinlock_t version_lock{};
-    
-    // [Not Reset] only modified by one bthread at any time, no need to be atomic
-    uint32_t* version_butex{NULL};
+
+    // [Not Reset] Backed by a butex (internally `butil::atomic<int>`). The version
+    // bump at bthread end is published with a release store, and join() observes
+    // it with an acquire load so the joined bthread's prior writes are visible
+    // after join() returns. All lock-free accesses must be atomic; liveness
+    // checks and reads before publishing a new task only need relaxed loads.
+    uint32_t* version_butex{nullptr};
 
     // The identifier. It does not have to be here, however many code is
     // simplified if they can get tid from TaskMeta.
     bthread_t tid{INVALID_BTHREAD};
 
+    int priority_index{-1};
+
     // User function and argument
-    void* (*fn)(void*){NULL};
-    void* arg{NULL};
+    void* (*fn)(void*){nullptr};
+    void* arg{nullptr};
 
     // Stack of this task.
-    ContextualStack* stack{NULL};
+    ContextualStack* stack{nullptr};
 
     // Attributes creating this task
     bthread_attr_t attr{BTHREAD_ATTR_NORMAL};
@@ -112,8 +129,10 @@ struct TaskMeta {
     TaskStatus status{TASK_STATUS_UNKNOWN};
     // Whether bthread is traced？
     bool traced{false};
+    // [Not Reset] guarantee tracing completion before jumping.
+    pthread_mutex_t trace_lock{};
     // Worker thread id.
-    pid_t worker_tid{-1};
+    pthread_t worker_tid{};
 
 public:
     // Only initialize [Not Reset] fields, other fields will be reset in
@@ -122,11 +141,13 @@ public:
         pthread_spin_init(&version_lock, 0);
         version_butex = butex_create_checked<uint32_t>();
         *version_butex = 1;
+        pthread_mutex_init(&trace_lock, nullptr);
     }
         
     ~TaskMeta() {
+        pthread_mutex_destroy(&trace_lock);
         butex_destroy(version_butex);
-        version_butex = NULL;
+        version_butex = nullptr;
         pthread_spin_destroy(&version_lock);
     }
 
@@ -136,7 +157,7 @@ public:
 
     ContextualStack* release_stack() {
         ContextualStack* tmp = stack;
-        stack = NULL;
+        stack = nullptr;
         return tmp;
     }
 
@@ -144,6 +165,24 @@ public:
         return static_cast<StackType>(attr.stack_type);
     }
 };
+
+// Global callback for creating a new bthread span when creating a new bthread.
+// This is set by brpc layer. When a bthread is created with BTHREAD_INHERIT_SPAN,
+// this callback is invoked to create a new span for the bthread.
+// The returned void* points to a heap-allocated weak_ptr<Span>* managed by brpc layer.
+// Returns nullptr if span creation is disabled or fails.
+extern void* (*g_create_bthread_span)();
+
+// Global destructor callback for rpcz_parent_span.
+// This is set by brpc layer to clean up the heap-allocated weak_ptr.
+// bthread layer doesn't know the concrete type, it just calls this function
+// with the void* pointer when cleaning up LocalStorage.
+extern void (*g_rpcz_parent_span_dtor)(void*);
+
+// Global callback invoked when a bthread ends (used by higher layers to
+// observe and react to bthread end events, e.g., to finish spans). This
+// pointer is set by the upper layer during initialization.
+extern void (*g_end_bthread_span)();
 
 }  // namespace bthread
 

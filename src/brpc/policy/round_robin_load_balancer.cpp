@@ -18,6 +18,7 @@
 
 #include "butil/macros.h"
 #include "butil/fast_rand.h"
+#include "bthread/prime_offset.h"
 #include "brpc/socket.h"
 #include "brpc/policy/round_robin_load_balancer.h"
 
@@ -108,7 +109,7 @@ int RoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
     }
     TLS tls = s.tls();
     if (tls.stride == 0) {
-        tls.stride = GenRandomStride();
+        tls.stride = bthread::prime_offset();
         // use random at first time, for the case of
         // use rr lb every time in new thread
         tls.offset = butil::fast_rand_less_than(n);
@@ -119,8 +120,7 @@ int RoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
         const SocketId id = s->server_list[tls.offset].id;
         if (((i + 1) == n  // always take last chance
              || !ExcludedServers::IsExcluded(in.excluded, id))
-            && Socket::Address(id, out->ptr) == 0
-            && (*out->ptr)->IsAvailable()) {
+            && IsServerAvailable(id, out->ptr)) {
             s.tls() = tls;
             return 0;
         }
@@ -134,10 +134,10 @@ int RoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
 
 RoundRobinLoadBalancer* RoundRobinLoadBalancer::New(
     const butil::StringPiece& params) const {
-    RoundRobinLoadBalancer* lb = new (std::nothrow) RoundRobinLoadBalancer;
-    if (lb && !lb->SetParameters(params)) {
+    RoundRobinLoadBalancer* lb = new RoundRobinLoadBalancer;
+    if (!lb->SetParameters(params)) {
         delete lb;
-        lb = NULL;
+        lb = nullptr;
     }
     return lb;
 }

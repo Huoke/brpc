@@ -155,7 +155,7 @@ void* DBDBthread(void* arg) {
         bthread_usleep(100 * 1000);
     }
 
-    return NULL;
+    return nullptr;
 }
 
 template <typename DBD>
@@ -170,12 +170,12 @@ void DBDMultiBthread() {
 
     bthread_t tids[10000];
     for (size_t i = 0; i < ARRAY_SIZE(tids); ++i) {
-        ASSERT_EQ(0, bthread_start_urgent(&tids[i], NULL, DBDBthread<DBD>, &d));
+        ASSERT_EQ(0, bthread_start_urgent(&tids[i], nullptr, DBDBthread<DBD>, &d));
     }
 
     // Modify during reading.
-    int64_t start = butil::gettimeofday_ms();
-    while (butil::gettimeofday_ms() - start < 10 * 1000) {
+    int64_t start = butil::cpuwide_time_ms();
+    while (butil::cpuwide_time_ms() - start < 10 * 1000) {
         d.Modify(AddN, 1);
         typename DBD::ScopedPtr ptr;
         d.Read(&ptr);
@@ -183,7 +183,7 @@ void DBDMultiBthread() {
     }
     exitFlag = true;
     for (size_t i = 0; i < ARRAY_SIZE(tids); ++i) {
-        ASSERT_EQ(0, bthread_join(tids[i], NULL));
+        ASSERT_EQ(0, bthread_join(tids[i], nullptr));
     }
 }
 
@@ -216,7 +216,7 @@ struct BAIDU_CACHELINE_ALIGNMENT PerfArgs {
     int64_t elapse_ns;
     bool ready;
 
-    PerfArgs() : dbd(NULL), counter(0), elapse_ns(0), ready(false) {}
+    PerfArgs() : dbd(nullptr), counter(0), elapse_ns(0), ready(false) {}
 };
 
 template<typename DBD>
@@ -241,7 +241,7 @@ void* read_dbd(void* void_arg) {
     }
     t.stop();
     args->elapse_ns = t.n_elapsed();
-    return NULL;
+    return nullptr;
 }
 
 template<typename DBD>
@@ -256,7 +256,7 @@ void PerfTest(int thread_num, bool modify_during_reading) {
     std::vector<PerfArgs<DBD>> args(thread_num);
     for (int i = 0; i < thread_num; ++i) {
         args[i].dbd = &dbd;
-        ASSERT_EQ(0, pthread_create(&threads[i], NULL, read_dbd<DBD>, &args[i]));
+        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, read_dbd<DBD>, &args[i]));
     }
     while (true) {
         bool all_ready = true;
@@ -277,9 +277,9 @@ void PerfTest(int thread_num, bool modify_during_reading) {
     ProfilerStart(prof_name);
     int64_t run_ms = 5 * 1000;
     if (modify_during_reading) {
-        int64_t start = butil::gettimeofday_ms();
+        int64_t start = butil::cpuwide_time_ms();
         int i = 1;
-        while (butil::gettimeofday_ms() - start < run_ms) {
+        while (butil::cpuwide_time_ms() - start < run_ms) {
             ASSERT_TRUE(dbd.Modify(AddMapN, i++));
             usleep(1000);
         }
@@ -291,7 +291,7 @@ void PerfTest(int thread_num, bool modify_during_reading) {
     int64_t wait_time = 0;
     int64_t count = 0;
     for (int i = 0; i < thread_num; ++i) {
-        pthread_join(threads[i], NULL);
+        pthread_join(threads[i], nullptr);
         wait_time += args[i].elapse_ns;
         count += args[i].counter;
     }
@@ -372,7 +372,7 @@ static void ValidateLALB(LALB& lalb, size_t N) {
         for (size_t R = 0; R < 2; ++R) {
             ASSERT_EQ((int64_t*)d[R].weight_tree[i].left, &lalb._left_weights[i]);
             size_t* pindex = d[R].server_map.seek(d[R].weight_tree[i].server_id);
-            ASSERT_TRUE(pindex != NULL && *pindex == i);
+            ASSERT_TRUE(pindex != nullptr && *pindex == i);
         }
         total += d[0].weight_tree[i].weight->volatile_value();
     }
@@ -431,11 +431,11 @@ struct SelectArg {
 };
 
 void* select_server(void* arg) {
-    SelectArg *sa = (SelectArg *)arg;
+    SelectArg *sa = (SelectArg*)arg;
     brpc::LoadBalancer* c = sa->lb;
     brpc::SocketUniquePtr ptr;
     CountMap *selected_count = new CountMap;
-    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
     brpc::LoadBalancer::SelectOut out(&ptr);
     uint32_t rand_seed = rand();
     if (sa->hash) {
@@ -468,8 +468,8 @@ class SaveRecycle : public brpc::SocketUser {
 
 TEST_F(LoadBalancerTest, update_while_selection) {
     for (size_t round = 0; round < 5; ++round) {
-        brpc::LoadBalancer* lb = NULL;
-        SelectArg sa = { NULL, NULL};
+        brpc::LoadBalancer* lb = nullptr;
+        SelectArg sa = { nullptr, nullptr};
         bool is_lalb = false;
         if (round == 0) {
             lb = new brpc::policy::RoundRobinLoadBalancer;
@@ -488,7 +488,7 @@ TEST_F(LoadBalancerTest, update_while_selection) {
 
         // Accessing empty lb should result in error.
         brpc::SocketUniquePtr ptr;
-        brpc::LoadBalancer::SelectIn in = { 0, false, true, 0, NULL };
+        brpc::LoadBalancer::SelectIn in = { 0, false, true, 0, nullptr };
         brpc::LoadBalancer::SelectOut out(&ptr);
         ASSERT_EQ(ENODATA, lb->SelectServer(in, &out));
 
@@ -528,7 +528,7 @@ TEST_F(LoadBalancerTest, update_while_selection) {
         butil::Timer tm;
         tm.start();
         for (size_t i = 0; i < ARRAY_SIZE(th); ++i) {
-            ASSERT_EQ(0, pthread_create(&th[i], NULL, select_server, &sa));
+            ASSERT_EQ(0, pthread_create(&th[i], nullptr, select_server, &sa));
         }
         std::vector<brpc::ServerId> removed;
         const size_t REP = 200;
@@ -610,8 +610,8 @@ TEST_F(LoadBalancerTest, update_while_selection) {
 
 TEST_F(LoadBalancerTest, fairness) {
     for (size_t round = 0; round < 6; ++round) {
-        brpc::LoadBalancer* lb = NULL;
-        SelectArg sa = { NULL, NULL};
+        brpc::LoadBalancer* lb = nullptr;
+        SelectArg sa = { nullptr, nullptr};
         if (round == 0) {
             lb = new brpc::policy::RoundRobinLoadBalancer;
         } else if (round == 1) {
@@ -661,7 +661,7 @@ TEST_F(LoadBalancerTest, fairness) {
         }
 
         for (size_t i = 0; i < ARRAY_SIZE(th); ++i) {
-            ASSERT_EQ(0, pthread_create(&th[i], NULL, select_server, &sa));
+            ASSERT_EQ(0, pthread_create(&th[i], nullptr, select_server, &sa));
         }
         bthread_usleep(10000);
         ProfilerStart((lb_name + ".prof").c_str());
@@ -794,7 +794,7 @@ TEST_F(LoadBalancerTest, consistent_hashing) {
         const size_t SELECT_TIMES = 1000000;
         std::map<butil::EndPoint, size_t> times;
         brpc::SocketUniquePtr ptr;
-        brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+        brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
         ::brpc::LoadBalancer::SelectOut out(&ptr);
         for (size_t i = 0; i < SELECT_TIMES; ++i) {
             in.has_request_code = true;
@@ -871,7 +871,7 @@ TEST_F(LoadBalancerTest, weighted_round_robin) {
     // consistent with weight configured.
     std::map<butil::EndPoint, size_t> select_result;
     brpc::SocketUniquePtr ptr;
-    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
     brpc::LoadBalancer::SelectOut out(&ptr);
     int total_weight = 12;
     std::vector<butil::EndPoint> select_servers;
@@ -911,9 +911,11 @@ TEST_F(LoadBalancerTest, weighted_round_robin_no_valid_server) {
         brpc::ServerId id(8888);
         brpc::SocketOptions options;
         options.remote_side = dummy;
-        options.user = new SaveRecycle;
         id.tag = weight[i];
         if (i < 2) {
+            // `user` is owned by the Socket; only allocate it when a Socket is
+            // actually created, otherwise it would leak.
+            options.user = new SaveRecycle;
             ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
         }
         EXPECT_TRUE(wrrlb.AddServer(id));
@@ -951,6 +953,7 @@ TEST_F(LoadBalancerTest, weighted_randomized) {
     brpc::policy::WeightedRandomizedLoadBalancer wrlb;
     size_t valid_weight_num = 4;
 
+    std::vector<brpc::SocketId> ids;
     // Add server to selected list. The server with invalid weight will be skipped.
     for (size_t i = 0;  i < ARRAY_SIZE(servers); ++i) {
         const char *addr = servers[i];
@@ -961,6 +964,7 @@ TEST_F(LoadBalancerTest, weighted_randomized) {
         options.remote_side = dummy;
         options.user = new SaveRecycle;
         ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+        ids.emplace_back(id.id);
         id.tag = weight[i];
         if (i < valid_weight_num) {
             int weight_num = 0;
@@ -979,7 +983,7 @@ TEST_F(LoadBalancerTest, weighted_randomized) {
     // weight randomized with weight configured.
     std::map<butil::EndPoint, size_t> select_result;
     brpc::SocketUniquePtr ptr;
-    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
     brpc::LoadBalancer::SelectOut out(&ptr);
     int run_times = configed_weight_sum * 100;
     std::vector<butil::EndPoint> select_servers;
@@ -1009,6 +1013,66 @@ TEST_F(LoadBalancerTest, weighted_randomized) {
         ASSERT_GE(actual_rate, expect_rate / 2);
         // actual_rate <= expect_rate * 2
         ASSERT_LE(actual_rate, expect_rate * 2);
+    }
+
+    for (size_t i = 1; i < ids.size(); ++i) {
+        brpc::Socket::SetFailed(ids[i]);
+    }
+    select_result.clear();
+    for (int i = 0; i < run_times; ++i) {
+        EXPECT_EQ(0, wrlb.SelectServer(in, &out));
+        // The only choice is servers[0].
+        ASSERT_STREQ(butil::endpoint2str(ptr->remote_side()).c_str(), servers[0]);
+    }
+}
+
+TEST_F(LoadBalancerTest, weighted_randomized_equal_weight) {
+    // With equal weights every server must get the same share of the traffic.
+    // The tolerance of `weighted_randomized` above is +/-2x, which is too loose
+    // to catch a single misplaced slot, so check the distribution tightly here.
+    const char* servers[] = {
+        "10.92.115.19:8831",
+        "10.42.108.25:8832",
+        "10.36.150.31:8833",
+        "10.36.150.32:8899"
+    };
+    brpc::policy::WeightedRandomizedLoadBalancer wrlb;
+    for (size_t i = 0; i < ARRAY_SIZE(servers); ++i) {
+        butil::EndPoint dummy;
+        ASSERT_EQ(0, str2endpoint(servers[i], &dummy));
+        brpc::ServerId id(8888);
+        brpc::SocketOptions options;
+        options.remote_side = dummy;
+        options.user = new SaveRecycle;
+        ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+        id.tag = "1";
+        ASSERT_TRUE(wrlb.AddServer(id));
+    }
+
+    std::map<butil::EndPoint, size_t> select_result;
+    brpc::SocketUniquePtr ptr;
+    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
+    brpc::LoadBalancer::SelectOut out(&ptr);
+    const int run_times = 40000;
+    for (int i = 0; i < run_times; ++i) {
+        ASSERT_EQ(0, wrlb.SelectServer(in, &out));
+        ++select_result[ptr->remote_side()];
+    }
+
+    // Every server must be selected at least once, in particular the one added
+    // last, which owns the largest prefix sum.
+    ASSERT_EQ(ARRAY_SIZE(servers), select_result.size());
+    const double expect_rate = 1.0 / ARRAY_SIZE(servers);
+    for (const auto& result : select_result) {
+        const double actual_rate = result.second * 1.0 / run_times;
+        std::cout << result.first << " select_times=" << result.second
+            << " actual_rate=" << actual_rate
+            << " expect_rate=" << expect_rate << std::endl;
+        // 0.9x ~ 1.1x of the expected rate. With n=40000 and p=0.25 the count has
+        // sigma = sqrt(n*p*(1-p)) ~= 86.6, so the +-10% band is about 11 sigma
+        // wide and a passing run is not luck.
+        ASSERT_GE(actual_rate, expect_rate * 0.9);
+        ASSERT_LE(actual_rate, expect_rate * 1.1);
     }
 }
 
@@ -1040,7 +1104,7 @@ TEST_F(LoadBalancerTest, health_check_no_valid_server) {
         // Without setting anything, the lb should work fine
         for (int i = 0; i < 4; ++i) {
             brpc::SocketUniquePtr ptr;
-            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
             brpc::LoadBalancer::SelectOut out(&ptr);
             ASSERT_EQ(0, lb->SelectServer(in, &out));
         }
@@ -1050,7 +1114,7 @@ TEST_F(LoadBalancerTest, health_check_no_valid_server) {
         ptr->_ninflight_app_health_check.store(1, butil::memory_order_relaxed);
         for (int i = 0; i < 4; ++i) {
             brpc::SocketUniquePtr ptr;
-            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
             brpc::LoadBalancer::SelectOut out(&ptr);
             ASSERT_EQ(0, lb->SelectServer(in, &out));
             // After putting server[0] into health check state, the only choice is servers[1]
@@ -1061,7 +1125,7 @@ TEST_F(LoadBalancerTest, health_check_no_valid_server) {
         ptr->_ninflight_app_health_check.store(1, butil::memory_order_relaxed);
         for (int i = 0; i < 4; ++i) {
             brpc::SocketUniquePtr ptr;
-            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
             brpc::LoadBalancer::SelectOut out(&ptr);
             // There is no server available
             ASSERT_EQ(EHOSTDOWN, lb->SelectServer(in, &out));
@@ -1076,7 +1140,7 @@ TEST_F(LoadBalancerTest, health_check_no_valid_server) {
         bool get_server2 = false; 
         for (int i = 0; i < 20; ++i) {
             brpc::SocketUniquePtr ptr;
-            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+            brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
             brpc::LoadBalancer::SelectOut out(&ptr);
             ASSERT_EQ(0, lb->SelectServer(in, &out));
             if (ptr->remote_side().port == 8832) {
@@ -1095,14 +1159,14 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
         "10.92.115.19:8832",
         "10.42.122.201:8833",
     };
-    brpc::LoadBalancer* lb = NULL;
+    std::unique_ptr<brpc::LoadBalancer> lb;
     int rand = butil::fast_rand_less_than(2);
     if (rand == 0) {
         brpc::policy::RandomizedLoadBalancer rlb;
-        lb = rlb.New("min_working_instances=2 hold_seconds=2");
+        lb.reset(rlb.New("min_working_instances=2 hold_seconds=2"));
     } else if (rand == 1) {
         brpc::policy::RoundRobinLoadBalancer rrlb;
-        lb = rrlb.New("min_working_instances=2 hold_seconds=2");
+        lb.reset(rrlb.New("min_working_instances=2 hold_seconds=2"));
     }
     brpc::SocketUniquePtr ptr[2];
     for (size_t i = 0; i < ARRAY_SIZE(servers); ++i) {
@@ -1117,7 +1181,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
         lb->AddServer(id);
     }
     brpc::SocketUniquePtr sptr;
-    brpc::LoadBalancer::SelectIn in = { 0, false, true, 0u, NULL };
+    brpc::LoadBalancer::SelectIn in = { 0, false, true, 0u, nullptr };
     brpc::LoadBalancer::SelectOut out(&sptr);
     ASSERT_EQ(0, lb->SelectServer(in, &out));
 
@@ -1134,10 +1198,17 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
         dummy_ptr->Revive(2);
     }
     bthread_usleep(brpc::FLAGS_detect_available_server_interval_ms * 1000);
-    // After one server is revived, the reject rate should be 50%
+    // After one server is revived, the reject rate should be ~50%.
+    // This is a statistical assertion, so use a large number of
+    // samples to make the fluctuation negligible, otherwise it may
+    // flake. With n samples and p=0.5, the std of (num_ereject - num_ok)
+    // is sqrt(n); allowing a deviation of 20% of n keeps the test
+    // meaningful (~45%-55%) while making a false failure practically
+    // impossible (>6 sigma).
     int num_ereject = 0;
     int num_ok = 0;
-    for (int i = 0; i < 100; ++i) {
+    int num_sample = 1000;
+    for (int i = 0; i < num_sample; ++i) {
         int rc = lb->SelectServer(in, &out);
         if (rc == brpc::EREJECT) {
             num_ereject++;
@@ -1147,7 +1218,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
             ASSERT_TRUE(false);
         }
     }
-    ASSERT_TRUE(abs(num_ereject - num_ok) < 30);
+    ASSERT_LT(abs(num_ereject - num_ok), num_sample / 5);
     bthread_usleep((2000 /* hold_seconds */ + 10) * 1000);
 
     // After enough waiting time, traffic should be sent to all available servers.
@@ -1241,7 +1312,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     {
         // trigger one server to health check
         brpc::Controller cntl;
-        stub.Echo(&cntl, &req, &res, NULL);
+        stub.Echo(&cntl, &req, &res, nullptr);
     }
     // This sleep make one server revived 700ms earlier than the other server, which
     // can make the server down again if no request limit policy are applied here.
@@ -1249,23 +1320,23 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     {
         // trigger the other server to health check
         brpc::Controller cntl;
-        stub.Echo(&cntl, &req, &res, NULL);
+        stub.Echo(&cntl, &req, &res, nullptr);
     }
 
     butil::EndPoint point(butil::IP_ANY, 7777);
     EchoServiceImpl service;
     brpc::Server server;
     ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
-    ASSERT_EQ(0, server.Start(point, NULL));
+    ASSERT_EQ(0, server.Start(point, nullptr));
 
     butil::EndPoint point2(butil::IP_ANY, 7778);
     EchoServiceImpl service2;
     brpc::Server server2;
     ASSERT_EQ(0, server2.AddService(&service2, brpc::SERVER_DOESNT_OWN_SERVICE));
-    ASSERT_EQ(0, server2.Start(point2, NULL));
+    ASSERT_EQ(0, server2.Start(point2, nullptr));
     
-    int64_t start_ms = butil::gettimeofday_ms();
-    while ((butil::gettimeofday_ms() - start_ms) < 3500) {
+    int64_t start_ms = butil::cpuwide_time_ms();
+    while ((butil::cpuwide_time_ms() - start_ms) < 3500) {
         Done* done = new Done;
         done->req.set_message("123");
         stub.Echo(&done->cntl, &done->req, &done->res, done);
@@ -1290,6 +1361,83 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     ASSERT_EQ(0, num_failed.load(butil::memory_order_relaxed));
 }
 #endif // BUTIL_USE_ASAN
+
+// Regression for #3268's incomplete migration of LocalityAwareLoadBalancer.
+//
+// #3268 switched `LocalityAwareLoadBalancer::Weight::Update::end_time_us` and
+// `LocalityAwareLoadBalancer::Describe::now` to `butil::cpuwide_time_us()`
+// while every caller that supplies `CallInfo::begin_time_us` (the RPC entry
+// in `Channel::CallMethod` and the retry sites in
+// `Controller::OnVersionedRPCReturned`) still uses `butil::gettimeofday_us()`.
+// The resulting time-source mismatch makes
+//
+//     latency = end_time_us - ci.begin_time_us
+//             = cpuwide_now - wallclock_begin
+//             ~= -1.7e15 us  (huge negative)
+//
+// trigger the
+//
+//     if (latency <= 0) { /* time skews, ignore the sample */ return 0; }
+//
+// short-circuit on every call. `_time_q` never accumulates samples,
+// `_avg_latency` stays at 0, and locality-aware weight feedback is silently
+// disabled. Visible downstream symptom: cold-start `list://` channels with
+// `lb=la` and 2 backends occasionally fail RPCs with `EHOSTDOWN`
+// ("Fail to select server") on retry even when one backend is healthy.
+//
+// This commit reverts the LA side of #3268, so `Weight::Update` and
+// `Describe` once again use `butil::gettimeofday_us()` to match every
+// existing caller of `CallInfo::begin_time_us`.
+//
+// The test below runs entirely against `LocalityAwareLoadBalancer` (no
+// Server / Channel is involved), so it is hermetic. It supplies a
+// gettimeofday-based `begin_time_us` (matching what `Channel::CallMethod`
+// passes today) and asserts that the LB records a positive `_avg_latency`,
+// rather than tripping the time-skew short-circuit.
+TEST_F(LoadBalancerTest, la_records_latency_with_consistent_time_source) {
+    LALB lalb;
+    char addr[] = "192.168.1.1:8080";
+    butil::EndPoint dummy;
+    ASSERT_EQ(0, str2endpoint(addr, &dummy));
+    brpc::ServerId id(8888);
+    brpc::SocketOptions options;
+    options.remote_side = dummy;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+    ASSERT_TRUE(lalb.AddServer(id));
+
+    auto avg_latency = [&]() -> int64_t {
+        std::ostringstream os;
+        brpc::DescribeOptions opts;
+        opts.verbose = true;
+        lalb.Describe(os, opts);
+        const std::string s = os.str();
+        const size_t p = s.find("avg_latency=");
+        if (p == std::string::npos) return -1;
+        return strtoll(s.c_str() + p + strlen("avg_latency="), nullptr, 10);
+    };
+
+    // Drive a few "RPCs": pick a server, sleep ~2ms, feed back. begin_time_us
+    // comes from gettimeofday_us(), matching what Channel::CallMethod and the
+    // retry sites in Controller::OnVersionedRPCReturned pass on every RPC.
+    for (int i = 0; i < 8; ++i) {
+        const int64_t begin_us = butil::gettimeofday_us();
+        brpc::SocketUniquePtr ptr;
+        brpc::LoadBalancer::SelectIn in = { begin_us, true, false, 0u, nullptr };
+        brpc::LoadBalancer::SelectOut out(&ptr);
+        ASSERT_EQ(0, lalb.SelectServer(in, &out));
+        bthread_usleep(2000);
+        brpc::LoadBalancer::CallInfo ci = { begin_us, id.id, 0, nullptr };
+        lalb.Feedback(ci);
+    }
+
+    // _avg_latency must reflect actual elapsed time. If this is 0, either
+    // Weight::Update::end_time_us was changed away from gettimeofday_us
+    // again (re-introducing the time-source mismatch) or some caller of
+    // CallInfo::begin_time_us drifted to a different clock domain.
+    EXPECT_GT(avg_latency(), 0);
+
+    ASSERT_EQ(0, brpc::Socket::SetFailed(id.id));
+}
 
 TEST_F(LoadBalancerTest, la_selection_too_long) {
     brpc::GlobalInitializeOrDie();

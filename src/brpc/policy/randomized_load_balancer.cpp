@@ -18,6 +18,7 @@
 
 #include "butil/macros.h"
 #include "butil/fast_rand.h"
+#include "bthread/prime_offset.h"
 #include "brpc/socket.h"
 #include "brpc/policy/randomized_load_balancer.h"
 #include "butil/strings/string_number_conversions.h"
@@ -112,13 +113,12 @@ int RandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
         const SocketId id = s->server_list[offset].id;
         if (((i + 1) == n  // always take last chance
              || !ExcludedServers::IsExcluded(in.excluded, id))
-            && Socket::Address(id, out->ptr) == 0
-            && (*out->ptr)->IsAvailable()) {
+            && IsServerAvailable(id, out->ptr)) {
             // We found an available server
             return 0;
         }
         if (stride == 0) {
-            stride = GenRandomStride();
+            stride = bthread::prime_offset();
         }
         // If `Address' failed, use `offset+stride' to retry so that
         // this failed server won't be visited again inside for
@@ -134,10 +134,10 @@ int RandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
 
 RandomizedLoadBalancer* RandomizedLoadBalancer::New(
     const butil::StringPiece& params) const {
-    RandomizedLoadBalancer* lb = new (std::nothrow) RandomizedLoadBalancer;
-    if (lb && !lb->SetParameters(params)) {
+    RandomizedLoadBalancer* lb = new RandomizedLoadBalancer;
+    if (!lb->SetParameters(params)) {
         delete lb;
-        lb = NULL;
+        lb = nullptr;
     }
     return lb;
 }

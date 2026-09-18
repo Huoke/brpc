@@ -51,7 +51,7 @@
 #include "bthread/task_group.h"
 
 namespace bthread {
-extern BAIDU_THREAD_LOCAL TaskGroup* tls_task_group;
+EXTERN_BAIDU_VOLATILE_THREAD_LOCAL(TaskGroup*, tls_task_group);
 }
 
 // This is the only place that both client/server must link, so we put
@@ -73,6 +73,7 @@ BAIDU_REGISTER_ERRNO(brpc::EEOF, "Got EOF");
 BAIDU_REGISTER_ERRNO(brpc::EUNUSED, "The socket was not needed");
 BAIDU_REGISTER_ERRNO(brpc::ESSL, "SSL related operation failed");
 BAIDU_REGISTER_ERRNO(brpc::EH2RUNOUTSTREAMS, "The H2 socket was run out of streams");
+BAIDU_REGISTER_ERRNO(brpc::EPROGREADTIMEOUT, "Progressive read timed out");
 
 BAIDU_REGISTER_ERRNO(brpc::EINTERNAL, "General internal error");
 BAIDU_REGISTER_ERRNO(brpc::ERESPONSE, "Bad response");
@@ -95,7 +96,8 @@ DEFINE_bool(graceful_quit_on_sigterm, false,
             "Register SIGTERM handle func to quit graceful");
 DEFINE_bool(graceful_quit_on_sighup, false,
             "Register SIGHUP handle func to quit graceful");            
-
+DEFINE_bool(log_idle_progressive_read_close, false,
+            "Print log when an idle progressive read is closed");
 const IdlNames idl_single_req_single_res = { "req", "res" };
 const IdlNames idl_single_req_multi_res = { "req", "" };
 const IdlNames idl_multi_req_single_res = { "", "res" };
@@ -114,7 +116,7 @@ static void PrintRevision(std::ostream& os, void*) {
 #endif
 }
 static bvar::PassiveStatus<std::string> s_rpc_revision(
-    "rpc_revision", PrintRevision, NULL);
+    "rpc_revision", PrintRevision, nullptr);
 
 static const int RETRY_AVOIDANCE = 8;
 
@@ -128,7 +130,7 @@ const Controller* GetSubControllerOfSelectiveChannel(
 DECLARE_bool(usercode_in_pthread);
 DECLARE_bool(usercode_in_coroutine);
 static const int MAX_RETRY_COUNT = 1000;
-static bvar::Adder<int64_t>* g_ncontroller = NULL;
+static bvar::Adder<int64_t>* g_ncontroller = nullptr;
 
 static pthread_once_t s_create_vars_once = PTHREAD_ONCE_INIT;
 
@@ -174,7 +176,227 @@ public:
     void OnEndOfMessage(const butil::Status&) {}
 };
 
-static IgnoreAllRead* s_ignore_all_read = NULL;
+struct ProgressiveReadTimeoutTask;
+
+struct ProgressiveReadTimeoutState {
+    ProgressiveReadTimeoutState(SocketId id, int32_t timeout_ms)
+        : socket_id(id)
+        , read_timeout_ms(timeout_ms)
+        , deadline_us(butil::cpuwide_time_us() + timeout_ms * 1000L)
+        , timer_id(0)
+        , timer_task(nullptr)
+        , user_callback_running(false)
+        , reader_failed(false)
+        , timeout_triggered(false)
+        , end_delivered(false) {}
+
+    butil::Mutex mutex;
+    const SocketId socket_id;
+    const int32_t read_timeout_ms;
+    int64_t deadline_us;
+    bthread_timer_t timer_id;
+    ProgressiveReadTimeoutTask* timer_task;
+    bool user_callback_running;
+    bool reader_failed;
+    bool timeout_triggered;
+    bool end_delivered;
+    butil::Status timer_error;
+};
+
+struct ProgressiveReadTimeoutTask {
+    explicit ProgressiveReadTimeoutTask(
+        const std::shared_ptr<ProgressiveReadTimeoutState>& state_in)
+        : state(state_in) {}
+
+    std::shared_ptr<ProgressiveReadTimeoutState> state;
+};
+
+class ProgressiveTimeoutReader : public ProgressiveReader {
+public:
+    ProgressiveTimeoutReader(SocketId id, int32_t read_timeout_ms,
+                             ProgressiveReader* reader)
+        : _reader(reader)
+        , _state(new ProgressiveReadTimeoutState(id, read_timeout_ms)) {}
+
+    int Start() {
+        std::unique_lock<butil::Mutex> mu(_state->mutex);
+        return AddWatchdogLocked(_state, _state->read_timeout_ms * 1000L);
+    }
+
+    butil::Status OnReadOnePart(const void* data, size_t length) override {
+        {
+            std::unique_lock<butil::Mutex> mu(_state->mutex);
+            if (_state->timeout_triggered) {
+                return MakeTimeoutStatus(_state->read_timeout_ms);
+            }
+            if (!_state->timer_error.ok()) {
+                return _state->timer_error;
+            }
+            _state->user_callback_running = true;
+        }
+
+        butil::Status status = _reader->OnReadOnePart(data, length);
+        {
+            std::unique_lock<butil::Mutex> mu(_state->mutex);
+            _state->user_callback_running = false;
+            if (_state->timeout_triggered) {
+                status = MakeTimeoutStatus(_state->read_timeout_ms);
+            } else if (!_state->timer_error.ok()) {
+                status = _state->timer_error;
+            } else if (status.ok() && !_state->end_delivered) {
+                _state->deadline_us = butil::cpuwide_time_us() +
+                    _state->read_timeout_ms * 1000L;
+            } else if (!status.ok()) {
+                _state->reader_failed = true;
+            }
+        }
+        return status;
+    }
+
+    void OnEndOfMessage(const butil::Status& status) override {
+        bthread_timer_t timer_id = 0;
+        ProgressiveReadTimeoutTask* timer_task = nullptr;
+        butil::Status final_status = status;
+        ProgressiveReader* reader = nullptr;
+        {
+            std::unique_lock<butil::Mutex> mu(_state->mutex);
+            if (_state->end_delivered) {
+                LOG(ERROR) << "ProgressiveReader::OnEndOfMessage was called more than once";
+                return;
+            }
+            _state->end_delivered = true;
+            timer_id = _state->timer_id;
+            timer_task = _state->timer_task;
+            _state->timer_id = 0;
+            _state->timer_task = nullptr;
+            if (_state->timeout_triggered) {
+                final_status = MakeTimeoutStatus(_state->read_timeout_ms);
+            } else if (!_state->timer_error.ok()) {
+                final_status = _state->timer_error;
+            }
+            reader = _reader;
+            _reader = nullptr;
+        }
+
+        CancelWatchdog(timer_id, timer_task);
+        reader->OnEndOfMessage(final_status);
+        delete this;
+    }
+
+private:
+    ~ProgressiveTimeoutReader() override {}
+
+    static butil::Status MakeTimeoutStatus(int32_t timeout_ms) {
+        return butil::Status(
+            EPROGREADTIMEOUT,
+            "Progressive read timed out after %d ms", timeout_ms);
+    }
+
+    static butil::Status MakeTimerErrorStatus(int error_code) {
+        return butil::Status(
+            error_code, "Fail to add progressive read timeout timer: %s",
+            berror(error_code));
+    }
+
+    static void CancelWatchdog(
+        bthread_timer_t timer_id, ProgressiveReadTimeoutTask* timer_task) {
+        if (timer_id == 0) {
+            return;
+        }
+        const int rc = bthread_timer_del(timer_id);
+        if (rc == 0) {
+            delete timer_task;
+        } else if (rc == 1 || rc == EINVAL) {
+            // The callback owns timer_task once it starts running. EINVAL means
+            // that the callback has already finished and released the task.
+        } else {
+            LOG(ERROR) << "Unexpected bthread_timer_del error=" << rc;
+        }
+    }
+
+    static int AddWatchdogLocked(
+        const std::shared_ptr<ProgressiveReadTimeoutState>& state,
+        int64_t delay_us) {
+        if (state->end_delivered || state->reader_failed) {
+            return ECANCELED;
+        }
+        if (delay_us <= 0) {
+            delay_us = 1;
+        }
+        ProgressiveReadTimeoutTask* task =
+            new (std::nothrow) ProgressiveReadTimeoutTask(state);
+        if (task == nullptr) {
+            return ENOMEM;
+        }
+        bthread_timer_t timer_id = 0;
+        const int rc = bthread_timer_add(
+            &timer_id, butil::microseconds_from_now(delay_us),
+            HandleIdleProgressiveReader, task);
+        if (rc != 0) {
+            delete task;
+            return rc;
+        }
+        state->timer_id = timer_id;
+        state->timer_task = task;
+        return 0;
+    }
+
+    static void HandleIdleProgressiveReader(void* arg) {
+        std::unique_ptr<ProgressiveReadTimeoutTask> task(
+            static_cast<ProgressiveReadTimeoutTask*>(arg));
+        const std::shared_ptr<ProgressiveReadTimeoutState> state = task->state;
+        bool fail_socket = false;
+        int error_code = 0;
+        std::string error_text;
+        {
+            std::unique_lock<butil::Mutex> mu(state->mutex);
+            if (state->timer_task == task.get()) {
+                state->timer_id = 0;
+                state->timer_task = nullptr;
+            }
+            if (state->end_delivered || state->reader_failed) {
+                return;
+            }
+
+            const int64_t now_us = butil::cpuwide_time_us();
+            if (state->user_callback_running || now_us < state->deadline_us) {
+                const int64_t delay_us = state->user_callback_running
+                    ? state->read_timeout_ms * 1000L
+                    : state->deadline_us - now_us;
+                const int rc = AddWatchdogLocked(state, delay_us);
+                if (rc != 0) {
+                    state->timer_error = MakeTimerErrorStatus(rc);
+                    fail_socket = true;
+                    error_code = rc;
+                    error_text = state->timer_error.error_str();
+                }
+            } else {
+                state->timeout_triggered = true;
+                fail_socket = true;
+                error_code = EPROGREADTIMEOUT;
+                error_text = MakeTimeoutStatus(state->read_timeout_ms).error_str();
+            }
+        }
+
+        if (!fail_socket) {
+            return;
+        }
+        SocketUniquePtr socket;
+        if (Socket::Address(state->socket_id, &socket) != 0) {
+            LOG(ERROR) << "Fail to address socket_id=" << state->socket_id
+                       << " after progressive read timeout";
+        } else {
+            LOG_IF(INFO, FLAGS_log_idle_progressive_read_close)
+                << error_text << ", socket_id=" << state->socket_id;
+            socket->SetFailed(error_code, "%s", error_text.c_str());
+        }
+    }
+
+    ProgressiveReader* _reader;
+    const std::shared_ptr<ProgressiveReadTimeoutState> _state;
+};
+
+static IgnoreAllRead* s_ignore_all_read = nullptr;
 static pthread_once_t s_ignore_all_read_once = PTHREAD_ONCE_INIT;
 static void CreateIgnoreAllRead() { s_ignore_all_read = new IgnoreAllRead; }
 
@@ -186,6 +408,7 @@ void Controller::ResetNonPods() {
     if (_span) {
         Span::Submit(_span, butil::cpuwide_time_us());
     }
+    _span.reset();
     _error_text.clear();
     _remote_side = butil::EndPoint();
     _local_side = butil::EndPoint();
@@ -205,7 +428,7 @@ void Controller::ResetNonPods() {
         DestroyParallelChannelDone(_done);
     }
     delete _sender;
-    _lb.reset(NULL);
+    _lb.reset(nullptr);
     _current_call.Reset();
     ExcludedServers::Destroy(_accessed);
     _request_buf.clear();
@@ -217,9 +440,9 @@ void Controller::ResetNonPods() {
     _response_attachment.clear();
     if (_wpa) {
         _wpa->MarkRPCAsDone(Failed());
-        _wpa.reset(NULL);
+        _wpa.reset(nullptr);
     }
-    if (_rpa != NULL) {
+    if (_rpa != nullptr) {
         if (!has_progressive_reader()) {
             // Never called ReadProgressiveAttachmentBy (successfully), the data
             // is probably being buffered and a full buffer may block parse
@@ -228,38 +451,40 @@ void Controller::ResetNonPods() {
             pthread_once(&s_ignore_all_read_once, CreateIgnoreAllRead);
             _rpa->ReadProgressiveAttachmentBy(s_ignore_all_read);
         }
-        _rpa.reset(NULL);
+        _rpa.reset(nullptr);
     }
     delete _remote_stream_settings;
+    _bind_sock.reset();
     _thrift_method_name.clear();
     _after_rpc_resp_fn = nullptr;
 
-    CHECK(_unfinished_call == NULL);
+    CHECK(_unfinished_call == nullptr);
 }
 
 void Controller::ResetPods() {
     // NOTE: Make the sequence of assignments same with the order that they're
     // defined in header. Better for cpu cache and faster for lookup.
-    _span = NULL;
     _flags = 0;
 #ifndef BAIDU_INTERNAL
     set_pb_bytes_to_base64(true);
 #endif
     _error_code = 0;
-    _session_local_data = NULL;
-    _server = NULL;
+    _session_local_data = nullptr;
+    _server = nullptr;
     _oncancel_id = INVALID_BTHREAD_ID;
-    _auth_context = NULL;
-    _sampled_request = NULL;
+    _auth_context = nullptr;
+    _sampled_request = nullptr;
     _request_protocol = PROTOCOL_UNKNOWN;
     _max_retry = UNSET_MAGIC_NUM;
-    _retry_policy = NULL;
+    _retry_policy = nullptr;
     _correlation_id = INVALID_BTHREAD_ID;
     _connection_type = CONNECTION_TYPE_UNKNOWN;
     _timeout_ms = UNSET_MAGIC_NUM;
     _backup_request_ms = UNSET_MAGIC_NUM;
-    _backup_request_policy = NULL;
+    _backup_request_policy = nullptr;
     _connect_timeout_ms = UNSET_MAGIC_NUM;
+    _progressive_read_timeout_ms = UNSET_MAGIC_NUM;
+    _progressive_read_socket_id = INVALID_SOCKET_ID;
     _real_timeout_ms = UNSET_MAGIC_NUM;
     _deadline_us = -1;
     _timeout_id = 0;
@@ -275,29 +500,31 @@ void Controller::ResetPods() {
     _pipelined_count = 0;
     _inheritable.Reset();
     _pchan_sub_count = 0;
-    _response = NULL;
-    _done = NULL;
-    _sender = NULL;
+    _response = nullptr;
+    _done = nullptr;
+    _sender = nullptr;
     _request_code = 0;
     _single_server_id = INVALID_SOCKET_ID;
-    _unfinished_call = NULL;
-    _stream_creator = NULL;
-    _accessed = NULL;
-    _pack_request = NULL;
-    _method = NULL;
-    _auth = NULL;
+    _unfinished_call = nullptr;
+    _stream_creator = nullptr;
+    _accessed = nullptr;
+    _pack_request = nullptr;
+    _method = nullptr;
+    _auth = nullptr;
     _idl_names = idl_single_req_single_res;
     _idl_result = IDL_VOID_RESULT;
-    _http_request = NULL;
-    _http_response = NULL;
-    _request_user_fields = NULL;
-    _response_user_fields = NULL;
+    _http_request = nullptr;
+    _http_response = nullptr;
+    _request_user_fields = nullptr;
+    _response_user_fields = nullptr;
     _request_content_type = CONTENT_TYPE_PB;
     _response_content_type = CONTENT_TYPE_PB;
     _request_streams.clear();
     _response_streams.clear();
-    _remote_stream_settings = NULL;
+    _remote_stream_settings = nullptr;
+    _session_data = nullptr;
     _auth_flags = 0;
+    _rpc_received_us = 0;
 }
 
 Controller::Call::Call(Controller::Call* rhs)
@@ -307,17 +534,19 @@ Controller::Call::Call(Controller::Call* rhs)
     , peer_id(rhs->peer_id)
     , begin_time_us(rhs->begin_time_us)
     , sending_sock(rhs->sending_sock.release())
+    // A backup/retry call never inherits the source call's bind-sock affinity.
+    , bind_sock_action(BIND_SOCK_NONE)
     , stream_user_data(rhs->stream_user_data) {
     // NOTE: fields in rhs should be reset because RPC could fail before
     // setting all the fields to next call and _current_call.OnComplete
     // will behave incorrectly.
     rhs->need_feedback = false;
     rhs->peer_id = INVALID_SOCKET_ID;
-    rhs->stream_user_data = NULL;
+    rhs->stream_user_data = nullptr;
 }
 
 Controller::Call::~Call() {
-    CHECK(sending_sock.get() == NULL);
+    CHECK(sending_sock.get() == nullptr);
 }
 
 void Controller::Call::Reset() {
@@ -326,8 +555,14 @@ void Controller::Call::Reset() {
     enable_circuit_breaker = false;
     peer_id = INVALID_SOCKET_ID;
     begin_time_us = 0;
-    sending_sock.reset(NULL);
-    stream_user_data = NULL;
+    sending_sock.reset(nullptr);
+    bind_sock_action = BIND_SOCK_NONE;
+    stream_user_data = nullptr;
+}
+
+void Controller::set_progressive_read_timeout_ms(
+    int32_t progressive_read_timeout_ms) {
+    _progressive_read_timeout_ms = progressive_read_timeout_ms;
 }
 
 void Controller::set_timeout_ms(int64_t timeout_ms) {
@@ -350,8 +585,16 @@ void Controller::set_backup_request_ms(int64_t timeout_ms) {
 }
 
 int64_t Controller::backup_request_ms() const {
-    int timeout_ms = NULL != _backup_request_policy ?
-        _backup_request_policy->GetBackupRequestMs(this) : _backup_request_ms;
+    int timeout_ms = _backup_request_ms;
+    if (nullptr != _backup_request_policy) {
+        const int32_t policy_ms = _backup_request_policy->GetBackupRequestMs(this);
+        // -1 is the designated sentinel: the policy defers to the channel-level
+        // backup_request_ms (set from ChannelOptions). Any other negative value
+        // disables backup for this RPC. Values >= 0 override directly.
+        if (policy_ms != -1) {
+            timeout_ms = policy_ms;
+        }
+    }
     if (timeout_ms > 0x7fffffff) {
         timeout_ms = 0x7fffffff;
         LOG(WARNING) << "backup_request_ms is limited to 0x7fffffff (roughly 24 days)";
@@ -396,7 +639,7 @@ void Controller::StartCancel() {
 
 static const char HEX_ALPHA[] = "0123456789ABCDEF";
 void Controller::AppendServerIdentiy() {
-    if (_server == NULL) {
+    if (_server == nullptr) {
         return;
     }
     if (is_security_mode()) {
@@ -427,7 +670,7 @@ inline void UpdateResponseHeader(Controller* cntl) {
             cntl->http_response().set_status_code(
                 ErrorCodeToStatusCode(cntl->ErrorCode()));
         } // else assume that status code is already set along with EHTTP.
-        if (cntl->server() != NULL) {
+        if (cntl->server() != nullptr) {
             // Override HTTP body at server-side to conduct error text
             // to the client.
             // The client-side should preserve body which may be a piece
@@ -525,7 +768,7 @@ public:
 
     static void* RunThis(void* arg) {
         ((RunOnCancelThread*)arg)->Run();
-        return NULL;
+        return nullptr;
     }
 
     void Run() {
@@ -553,12 +796,12 @@ int Controller::RunOnCancel(bthread_id_t id, void* data, int error_code) {
     RunOnCancelThread* arg = new RunOnCancelThread(
         static_cast<google::protobuf::Closure*>(data), id);
     bthread_t th;
-    CHECK_EQ(0, bthread_start_urgent(&th, NULL, RunOnCancelThread::RunThis, arg));
+    CHECK_EQ(0, bthread_start_urgent(&th, nullptr, RunOnCancelThread::RunThis, arg));
     return 0;
 }
 
 void Controller::NotifyOnCancel(google::protobuf::Closure* callback) {
-    if (NULL == callback) {
+    if (nullptr == callback) {
         LOG(WARNING) << "Parameter `callback' is NLLL";
         return;
     }
@@ -607,7 +850,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             // Complete failed backup request.
             _unfinished_call->OnComplete(this, _error_code, info.responded, false);
             delete _unfinished_call;
-            _unfinished_call = NULL;
+            _unfinished_call = nullptr;
         }
         // Ignore all non-backup requests and failed backup requests.
         _error_code = saved_error;
@@ -616,12 +859,22 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
         return;
     }
 
-    if ((!_error_code && _retry_policy == NULL) ||
+    if (is_ending_rpc()) {
+        // SelectiveChannel may still deliver late SubDone callbacks after the
+        // main RPC has entered EndRPC(). Ignore those callbacks instead of
+        // letting them re-enter retry/backup on partially torn-down state.
+        _error_code = saved_error;
+        response_attachment().clear();
+        CHECK_EQ(0, bthread_id_unlock(info.id));
+        return;
+    }
+
+    if ((!_error_code && _retry_policy == nullptr) ||
         _current_call.nretry >= _max_retry) {
         goto END_OF_RPC;
     }
     if (_error_code == EBACKUPREQUEST) {
-        if (NULL != _backup_request_policy && !_backup_request_policy->DoBackup(this)) {
+        if (nullptr != _backup_request_policy && !_backup_request_policy->DoBackup(this)) {
             // No need to do backup request.
             _error_code = saved_error;
             CHECK_EQ(0, bthread_id_unlock(info.id));
@@ -641,10 +894,10 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             goto END_OF_RPC;
         }
         if (!SingleServer()) {
-            if (_accessed == NULL) {
+            if (_accessed == nullptr) {
                 _accessed = ExcludedServers::Create(
                     std::min(_max_retry, RETRY_AVOIDANCE));
-                if (NULL == _accessed) {
+                if (nullptr == _accessed) {
                     SetFailed(ENOMEM, "Fail to create ExcludedServers");
                     goto END_OF_RPC;
                 }
@@ -652,12 +905,8 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             _accessed->Add(_current_call.peer_id);
         }
         // _current_call does not end yet.
-        CHECK(_unfinished_call == NULL);  // only one backup request now.
-        _unfinished_call = new (std::nothrow) Call(&_current_call);
-        if (_unfinished_call == NULL) {
-            SetFailed(ENOMEM, "Fail to new Call");
-            goto END_OF_RPC;
-        }
+        CHECK(_unfinished_call == nullptr);  // only one backup request now.
+        _unfinished_call = new Call(&_current_call);
         ++_current_call.nretry;
         add_flag(FLAGS_BACKUP_REQUEST);
         return IssueRPC(butil::gettimeofday_us());
@@ -669,10 +918,10 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             //  * ERPCTIMEDOUT/ECANCELED are not retrying error by default.
             CHECK_EQ(current_id(), info.id) << "error_code=" << _error_code;
             if (!SingleServer()) {
-                if (_accessed == NULL) {
+                if (_accessed == nullptr) {
                     _accessed = ExcludedServers::Create(
                             std::min(_max_retry, RETRY_AVOIDANCE));
-                    if (NULL == _accessed) {
+                    if (nullptr == _accessed) {
                         SetFailed(ENOMEM, "Fail to create ExcludedServers");
                         goto END_OF_RPC;
                     }
@@ -690,7 +939,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             response_attachment().clear();
 
             // Retry backoff.
-            bthread::TaskGroup* g = bthread::tls_task_group;
+            bthread::TaskGroup* g = bthread::BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
             int64_t backoff_time_us = retry_policy->GetBackoffTimeMs(this) * 1000L;
             if (backoff_time_us > 0 &&
                 backoff_time_us < _deadline_us - butil::gettimeofday_us()) {
@@ -733,7 +982,7 @@ END_OF_RPC:
         // FLAGS_DESTROY_CID_IN_DONE to true must be aware of
         // -usercode_in_pthread and avoid deadlock by their own (TBR)
 
-        if ((FLAGS_usercode_in_pthread || _done != NULL/*Note[_done]*/) &&
+        if ((FLAGS_usercode_in_pthread || _done != nullptr/*Note[_done]*/) &&
             !has_flag(FLAGS_DESTROY_CID_IN_DONE)/*Note[cid]*/) {
             bthread_id_about_to_destroy(info.id);
         }
@@ -742,13 +991,14 @@ END_OF_RPC:
         bthread_t bt;
         bthread_attr_t attr = (FLAGS_usercode_in_pthread ?
                                BTHREAD_ATTR_PTHREAD : BTHREAD_ATTR_NORMAL);
+        bthread_attr_set_name(&attr, "RunEndRPC");
         _tmp_completion_info = info;
         if (bthread_start_background(&bt, &attr, RunEndRPC, this) != 0) {
             LOG(FATAL) << "Fail to start bthread";
             EndRPC(info);
         }
     } else {
-        if (_done != NULL/*Note[_done]*/ &&
+        if (_done != nullptr/*Note[_done]*/ &&
             !has_flag(FLAGS_DESTROY_CID_IN_DONE)/*Note[cid]*/) {
             bthread_id_about_to_destroy(info.id);
         }
@@ -759,7 +1009,7 @@ END_OF_RPC:
 void* Controller::RunEndRPC(void* arg) {
     Controller* c = static_cast<Controller*>(arg);
     c->EndRPC(c->_tmp_completion_info);
-    return NULL;
+    return nullptr;
 }
 
 inline bool does_error_affect_main_socket(int error_code) {
@@ -780,10 +1030,10 @@ void Controller::Call::OnComplete(
         Controller* c, int error_code/*note*/, bool responded, bool end_of_rpc) {
     if (stream_user_data) {
         stream_user_data->DestroyStreamUserData(sending_sock, c, error_code, end_of_rpc);
-        stream_user_data = NULL;
+        stream_user_data = nullptr;
     }
 
-    if (sending_sock != NULL) {
+    if (sending_sock != nullptr) {
         if (error_code != 0) {
             sending_sock->AddRecentError();
         }
@@ -801,9 +1051,9 @@ void Controller::Call::OnComplete(
         // Set main socket to be failed for connection refusal of streams.
         // "single" streams are often maintained in a separate SocketMap and
         // different from the main socket as well.
-        if (c->_stream_creator != NULL &&
+        if (c->_stream_creator != nullptr &&
             does_error_affect_main_socket(error_code) &&
-            (sending_sock == NULL || sending_sock->id() != peer_id)) {
+            (sending_sock == nullptr || sending_sock->id() != peer_id)) {
             Socket::SetFailed(peer_id);
         }
         break;
@@ -813,8 +1063,14 @@ void Controller::Call::OnComplete(
         // Otherwise in-flight responses may come back in future and break the
         // assumption that one pooled connection cannot have more than one
         // message at the same time.
-        if (sending_sock != NULL && (error_code == 0 || responded)) {
-            if (!sending_sock->is_read_progressive()) {
+        if (sending_sock != nullptr && (error_code == 0 || responded)) {
+            if (bind_sock_action == BIND_SOCK_RESERVE) {
+                // Reserve this socket on the controller for a following RPC
+                // (used by mysql transactions for connection affinity).
+                c->_bind_sock.reset(sending_sock.release());
+            } else if (bind_sock_action == BIND_SOCK_USE) {
+                // Socket is owned by the binder; do not return it to the pool.
+            } else if (!sending_sock->is_read_progressive()) {
                 // Normally-read socket which will not be used after RPC ends,
                 // safe to return. Notice that Socket::is_read_progressive may
                 // differ from Controller::is_response_read_progressively()
@@ -829,10 +1085,14 @@ void Controller::Call::OnComplete(
         }
         // fall through
     case CONNECTION_TYPE_SHORT:
-        if (sending_sock != NULL) {
+        if (sending_sock != nullptr) {
             // Check the comment in CONNECTION_TYPE_POOLED branch.
-            if (!sending_sock->is_read_progressive()) {
-                if (c->_stream_creator == NULL) {
+            if (bind_sock_action == BIND_SOCK_RESERVE) {
+                c->_bind_sock.reset(sending_sock.release());
+            } else if (bind_sock_action == BIND_SOCK_USE) {
+                // Socket is owned by the binder; do not fail it.
+            } else if (!sending_sock->is_read_progressive()) {
+                if (c->_stream_creator == nullptr) {
                     sending_sock->SetFailed();
                 }
             } else {
@@ -860,17 +1120,19 @@ void Controller::Call::OnComplete(
         }
     }
 
-    if (need_feedback) {
+    if (need_feedback && c->_lb) {
         const LoadBalancer::CallInfo info =
             { begin_time_us, peer_id, error_code, c };
         c->_lb->Feedback(info);
     }
 
     // Release the `Socket' we used to send/receive data
-    sending_sock.reset(NULL);
+    sending_sock.reset(nullptr);
 }
 
 void Controller::EndRPC(const CompletionInfo& info) {
+    add_flag(FLAGS_ENDING_RPC);
+
     if (_timeout_id != 0) {
         bthread_timer_del(_timeout_id);
         _timeout_id = 0;
@@ -878,12 +1140,12 @@ void Controller::EndRPC(const CompletionInfo& info) {
 
     // End _current_call and _unfinished_call.
     if (info.id == current_id() || info.id == _correlation_id) {
-        if (_current_call.sending_sock != NULL) {
+        if (_current_call.sending_sock != nullptr) {
             _remote_side = _current_call.sending_sock->remote_side();
             _local_side = _current_call.sending_sock->local_side();
         }
 
-        if (_unfinished_call != NULL) {
+        if (_unfinished_call != nullptr) {
             // When _current_call is successful, mark _unfinished_call as
             // EBACKUPREQUEST, we can't use 0 because the server possibly
             // never respond, we can't use ERPCTIMEDOUT because _current_call
@@ -894,17 +1156,20 @@ void Controller::EndRPC(const CompletionInfo& info) {
             const int err = (_error_code == 0 ? EBACKUPREQUEST : _error_code);
             _unfinished_call->OnComplete(this, err, false, false);
             delete _unfinished_call;
-            _unfinished_call = NULL;
+            _unfinished_call = nullptr;
         }
         // TODO: Replace this with stream_creator.
         HandleStreamConnection(_current_call.sending_sock.get());
+        // Propagate the reserve action; OnComplete only actually reserves the
+        // socket when the RPC succeeded (its error_code==0 || responded guard).
+        _current_call.bind_sock_action = bind_sock_action();
         _current_call.OnComplete(this, _error_code, info.responded, true);
     } else {
         // Even if _unfinished_call succeeded, we don't use EBACKUPREQUEST
         // (which gets punished in LALB) for _current_call because _current_call
         // is sent after _unfinished_call, it's just normal that _current_call
         // does not respond before _unfinished_call.
-        if (_unfinished_call == NULL) {
+        if (_unfinished_call == nullptr) {
             CHECK(false) << "A previous non-backup request responded, cid="
                          << info.id << " current_cid=" << current_id()
                          << " initial_cid=" << _correlation_id
@@ -912,8 +1177,8 @@ void Controller::EndRPC(const CompletionInfo& info) {
                          << " sending_sock=" << _current_call.sending_sock.get();
         }
         _current_call.OnComplete(this, ECANCELED, false, false);
-        if (_unfinished_call != NULL) {
-            if (_unfinished_call->sending_sock != NULL) {
+        if (_unfinished_call != nullptr) {
+            if (_unfinished_call->sending_sock != nullptr) {
                 _remote_side = _unfinished_call->sending_sock->remote_side();
                 _local_side = _unfinished_call->sending_sock->local_side();
             }
@@ -928,12 +1193,12 @@ void Controller::EndRPC(const CompletionInfo& info) {
             }
 
             delete _unfinished_call;
-            _unfinished_call = NULL;
+            _unfinished_call = nullptr;
         }
     }
     if (_stream_creator) {
         _stream_creator->DestroyStreamCreator(this);
-        _stream_creator = NULL;
+        _stream_creator = nullptr;
     }
     // Clear _error_text when the call succeeded, otherwise a successful
     // call with non-empty ErrorText may confuse user.
@@ -994,7 +1259,7 @@ void Controller::EndRPC(const CompletionInfo& info) {
 
 void Controller::OnRPCEnd(int64_t end_time_us) {
     _end_time_us = end_time_us;
-    if (NULL != _backup_request_policy) {
+    if (nullptr != _backup_request_policy) {
         _backup_request_policy->OnRPCEnd(this);
     }
 }
@@ -1018,12 +1283,16 @@ void Controller::DoneInBackupThread() {
 
 void Controller::SubmitSpan() {
     const int64_t now = butil::cpuwide_time_us();
-    _span->set_start_callback_us(now);
-    if (_span->local_parent()) {
-        _span->local_parent()->AsParent();
+    if (_span) {
+        _span->set_start_callback_us(now);
+        if (auto parent_span = _span->local_parent().lock()) {
+            if (parent_span->is_active()) {
+                parent_span->AsParent();
+            }
+        }
+        Span::Submit(_span, now);
+        _span.reset();
     }
-    Span::Submit(_span, now);
-    _span = NULL;
 }
 
 void Controller::HandleSendFailed() {
@@ -1039,7 +1308,7 @@ void Controller::HandleSendFailed() {
     // same stack of CallMethod, the code is deadlocked.
     // We don't need to run the callback in new thread in a sync call since
     // the created thread needs to be joined anyway before end of CallMethod.
-    const bool new_bthread = (_done != NULL && !is_done_allowed_to_run_in_place());
+    const bool new_bthread = (_done != nullptr && !is_done_allowed_to_run_in_place());
     OnVersionedRPCReturned(info, new_bthread, _error_code);
 }
 
@@ -1078,7 +1347,18 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     _current_call.need_feedback = false;
     _current_call.enable_circuit_breaker = has_enabled_circuit_breaker();
     SocketUniquePtr tmp_sock;
-    if (SingleServer()) {
+    if ((_connection_type & CONNECTION_TYPE_POOLED_AND_SHORT) &&
+        bind_sock_action() == BIND_SOCK_USE) {
+        // Reuse the socket reserved by a previous RPC (mysql transaction affinity).
+        tmp_sock.reset(_bind_sock.release());
+        if (!tmp_sock || (!is_health_check_call() && !tmp_sock->IsAvailable())) {
+            SetFailed(EHOSTDOWN, "Not connected to bind socket yet, server_id=%" PRIu64,
+                      tmp_sock ? tmp_sock->id() : (SocketId)0);
+            tmp_sock.reset();  // Release ref ASAP
+            return HandleSendFailed();
+        }
+        _current_call.peer_id = tmp_sock->id();
+    } else if (SingleServer()) {
         // Don't use _current_call.peer_id which is set to -1 after construction
         // of the backup call.
         const int rc = Socket::Address(_single_server_id, &tmp_sock);
@@ -1121,18 +1401,17 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         CHECK_EQ(_remote_side, tmp_sock->remote_side());
     }
 
-    Span* span = _span;
-    if (span) {
+    if (_span) {
         if (_current_call.nretry == 0) {
-            span->set_remote_side(_remote_side);
+            _span->set_remote_side(_remote_side);
         } else {
-            span->Annotate("Retrying %s",
-                           endpoint2str(_remote_side).c_str());
+            _span->Annotate("Retrying %s",
+                            endpoint2str(_remote_side).c_str());
         }
     }
     // Handle connection type
     if (_connection_type == CONNECTION_TYPE_SINGLE ||
-        _stream_creator != NULL) { // let user decides the sending_sock
+        _stream_creator != nullptr) { // let user decides the sending_sock
         // in the callback(according to connection_type) directly
         _current_call.sending_sock.reset(tmp_sock.release());
         // TODO(gejun): Setting preferred index of single-connected socket
@@ -1144,7 +1423,10 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         _current_call.sending_sock->set_preferred_index(_preferred_index);
     } else {
         int rc = 0;
-        if (_connection_type == CONNECTION_TYPE_POOLED) {
+        if (bind_sock_action() == BIND_SOCK_USE) {
+            // Already holding the reserved socket; use it directly.
+            _current_call.sending_sock.reset(tmp_sock.release());
+        } else if (_connection_type == CONNECTION_TYPE_POOLED) {
             rc = tmp_sock->GetPooledSocket(&_current_call.sending_sock);
         } else if (_connection_type == CONNECTION_TYPE_SHORT) {
             rc = tmp_sock->GetShortSocket(&_current_call.sending_sock);
@@ -1166,7 +1448,8 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         _current_call.sending_sock->set_preferred_index(_preferred_index);
         // Set preferred_index of main_socket as well to make it easier to
         // debug and observe from /connections.
-        if (tmp_sock->preferred_index() < 0) {
+        // tmp_sock is nullptr on the BIND_SOCK_USE path.
+        if (tmp_sock && tmp_sock->preferred_index() < 0) {
             tmp_sock->set_preferred_index(_preferred_index);
         }
         tmp_sock.reset();
@@ -1181,8 +1464,8 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     }
 
     // Handle authentication
-    const Authenticator* using_auth = NULL;
-    if (_auth != NULL) {
+    const Authenticator* using_auth = nullptr;
+    if (_auth != nullptr) {
         // Only one thread will be the winner and get the right to pack
         // authentication information, others wait until the request
         // is sent.
@@ -1197,7 +1480,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     }
     // Make request
     butil::IOBuf packet;
-    SocketMessage* user_packet = NULL;
+    SocketMessage* user_packet = nullptr;
     _pack_request(&packet, &user_packet, cid.value, _method, this,
                   _request_buf, using_auth);
     // TODO: PackRequest may accept SocketMessagePtr<>?
@@ -1212,7 +1495,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     }
 
     timespec connect_abstime;
-    timespec* pabstime = NULL;
+    timespec* pabstime = nullptr;
     if (_connect_timeout_ms > 0) {
         if (_deadline_us >= 0) {
             connect_abstime = butil::microseconds_to_timespec(
@@ -1234,7 +1517,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     int rc;
     size_t packet_size = 0;
     if (user_packet_guard) {
-        if (span) {
+        if (_span) {
             packet_size = user_packet_guard->EstimatedByteSize();
         }
         rc = _current_call.sending_sock->Write(user_packet_guard, &wopt);
@@ -1242,13 +1525,13 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         packet_size = packet.size();
         rc = _current_call.sending_sock->Write(&packet, &wopt);
     }
-    if (span) {
+    if (_span) {
         if (_current_call.nretry == 0) {
-            span->set_sent_us(butil::cpuwide_time_us());
-            span->set_request_size(packet_size);
+            _span->set_sent_us(butil::cpuwide_time_us());
+            _span->set_request_size(packet_size);
         } else {
-            span->Annotate("Requested(%lld) [%d]",
-                           (long long)packet_size, _current_call.nretry + 1);
+            _span->Annotate("Requested(%lld) [%d]",
+                            (long long)packet_size, _current_call.nretry + 1);
         }
     }
     if (using_auth) {
@@ -1261,7 +1544,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
 }
 
 void Controller::set_auth_context(const AuthContext* ctx) {
-    if (_auth_context != NULL) {
+    if (_auth_context != nullptr) {
         LOG(FATAL) << "Impossible! This function is supposed to be called "
                  "only once when verification succeeds in server side";
         return;
@@ -1308,13 +1591,13 @@ int Controller::HandleSocketFailed(bthread_id_t id, void* data, int error_code,
         std::unique_ptr<OnVersionedRPCReturnedArgs> args(static_cast<OnVersionedRPCReturnedArgs*>(p));
         CompletionInfo info = { args->id, false };
         args->cntl->OnVersionedRPCReturned(info, true, args->error);
-        return NULL;
+        return nullptr;
     };
 
     auto* args = new OnVersionedRPCReturnedArgs{ id, cntl, saved_error };
     bthread_t tid;
     // RetryPolicy may block current bthread, so start a new bthread to run OnVersionedRPCReturned
-    if (!cntl->_retry_policy || bthread_start_background(&tid, NULL, func, args) != 0) {
+    if (!cntl->_retry_policy || bthread_start_background(&tid, nullptr, func, args) != 0) {
         func(args);
     }
     return 0;
@@ -1349,6 +1632,7 @@ void Controller::SaveClientSettings(ClientSettings* s) const {
     s->connection_type = _connection_type;
     s->request_compress_type = _request_compress_type;
     s->request_checksum_type = _request_checksum_type;
+    s->request_checksum_with_attachment = request_checksum_attachment();
     s->log_id = log_id();
     s->has_request_code = has_request_code();
     s->request_code = _request_code;
@@ -1363,6 +1647,7 @@ void Controller::ApplyClientSettings(const ClientSettings& s) {
     set_connection_type(s.connection_type);
     set_request_compress_type(s.request_compress_type);
     set_request_checksum_type(s.request_checksum_type);
+    set_request_checksum_attachment(s.request_checksum_with_attachment);
     set_log_id(s.log_id);
     set_flag(FLAGS_REQUEST_CODE, s.has_request_code);
     _request_code = s.request_code;
@@ -1377,17 +1662,28 @@ int Controller::sub_count() const {
 }
 
 const Controller* Controller::sub(int index) const {
-    if (_pchan_sub_count > 0 && _done != NULL) {
+    if (_pchan_sub_count > 0 && _done != nullptr) {
         return GetSubControllerOfParallelChannel(_done, index);
     }
-    if (_sender != NULL) {
+    if (_sender != nullptr) {
         return GetSubControllerOfSelectiveChannel(_sender, index);
     }
-    return NULL;
+    return nullptr;
 }
 
-uint64_t Controller::trace_id() const { return _span ? _span->trace_id() : 0; }
-uint64_t Controller::span_id() const { return _span ? _span->span_id() : 0; }
+uint64_t Controller::trace_id() const {
+    if (_span) {
+        return _span->trace_id();
+    }
+    return 0;
+}
+
+uint64_t Controller::span_id() const {
+    if (_span) {
+        return _span->span_id();
+    }
+    return 0;
+}
 
 void* Controller::session_local_data() {
     if (_session_local_data) {
@@ -1400,7 +1696,7 @@ void* Controller::session_local_data() {
             return _session_local_data;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 void Controller::HandleStreamConnection(Socket *host_socket) {
@@ -1409,15 +1705,23 @@ void Controller::HandleStreamConnection(Socket *host_socket) {
         return;
     }
     size_t stream_num = _request_streams.size();
-    std::vector<SocketUniquePtr> ptrs(stream_num);
+    const size_t expected_extra_streams = stream_num - 1;
+    std::vector<StreamUniquePtr> ptrs(stream_num);
     if (!FailedInline()) {
-        if (_remote_stream_settings == NULL) {
+        if (_remote_stream_settings == nullptr) {
             if (!FailedInline()) {
                 SetFailed(EREQUEST, "The server didn't accept the stream");
             }
+        } else if (static_cast<size_t>(
+                       _remote_stream_settings->extra_stream_ids_size()) !=
+                   expected_extra_streams) {
+            SetFailed(ERESPONSE, "Server returned %d extra_stream_ids, "
+                      "expected %zu",
+                      _remote_stream_settings->extra_stream_ids_size(),
+                      expected_extra_streams);
         } else {
             for (size_t i = 0; i < stream_num; ++i) {
-                if (Socket::Address(_request_streams[i], &ptrs[i]) != 0) {
+                if (Stream::Address(_request_streams[i], &ptrs[i]) != 0) {
                     if (!FailedInline()) {
                         SetFailed(EREQUEST, "Request stream=%" PRIu64 " was closed before responded",
                                   _request_streams[i]);
@@ -1430,7 +1734,7 @@ void Controller::HandleStreamConnection(Socket *host_socket) {
     if (FailedInline()) {
         Stream::SetFailed(_request_streams, _error_code,
                           "%s", _error_text.c_str());
-        if (_remote_stream_settings != NULL) {
+        if (_remote_stream_settings != nullptr) {
             policy::SendStreamRst(host_socket,
                                   _remote_stream_settings->stream_id());
             for (int i = 0; i < _remote_stream_settings->extra_stream_ids().size(); ++i) {
@@ -1440,15 +1744,22 @@ void Controller::HandleStreamConnection(Socket *host_socket) {
         }
         return;
     }
-    Stream* s = (Stream*)ptrs[0]->conn();
+    Stream* s = ptrs[0].get();
     s->SetConnected(_remote_stream_settings);
     if (stream_num > 1) {
         auto extra_stream_ids = std::move(*_remote_stream_settings->mutable_extra_stream_ids());
         _remote_stream_settings->clear_extra_stream_ids();
         for (size_t i = 1; i < stream_num; ++i) {
-            Stream* extra_stream = (Stream *) ptrs[i]->conn();
+            if(!ptrs[i]) continue;
+            Stream* extra_stream = ptrs[i].get();
             _remote_stream_settings->set_stream_id(extra_stream_ids[i - 1]);
-            s->SetHostSocket(host_socket);
+            if (extra_stream->SetHostSocket(host_socket) != 0) {
+                SetFailed(EREQUEST, "Fail to bind response stream=%" PRIu64,
+                          extra_stream_ids[i - 1]);
+                Stream::SetFailed(_request_streams, _error_code,
+                                  "%s", _error_text.c_str());
+                return;
+            }
             extra_stream->SetConnected(_remote_stream_settings);
         }
     }
@@ -1483,7 +1794,7 @@ void Controller::reset_sampled_request(SampledRequest* req) {
 
 SampledRequest* Controller::release_sampled_request() {
     SampledRequest* saved_sampled_request = _sampled_request;
-    _sampled_request = NULL;
+    _sampled_request = nullptr;
     return saved_sampled_request;
 }
 
@@ -1499,15 +1810,15 @@ butil::intrusive_ptr<ProgressiveAttachment>
 Controller::CreateProgressiveAttachment(StopStyle stop_style) {
     if (has_progressive_writer()) {
         LOG(ERROR) << "One controller can only have one ProgressiveAttachment";
-        return NULL;
+        return nullptr;
     }
     if (_request_protocol != PROTOCOL_HTTP) {
         LOG(ERROR) << "Only http supports ProgressiveAttachment now";
-        return NULL;
+        return nullptr;
     }
-    if (_current_call.sending_sock == NULL) {
+    if (_current_call.sending_sock == nullptr) {
         LOG(ERROR) << "sending_sock is NULL";
-        return NULL;
+        return nullptr;
     }
     SocketUniquePtr httpsock;
     _current_call.sending_sock->ReAddress(&httpsock);
@@ -1521,7 +1832,7 @@ Controller::CreateProgressiveAttachment(StopStyle stop_style) {
 }
 
 void Controller::ReadProgressiveAttachmentBy(ProgressiveReader* r) {
-    if (r == NULL) {
+    if (r == nullptr) {
         LOG(FATAL) << "Param[r] is NULL";
         return;
     }
@@ -1531,7 +1842,7 @@ void Controller::ReadProgressiveAttachmentBy(ProgressiveReader* r) {
                          "controller without calling "
                          "response_will_be_read_progressively() before"));
     }
-    if (_rpa == NULL) {
+    if (_rpa == nullptr) {
         return r->OnEndOfMessage(
             butil::Status(EINVAL, "ReadableProgressiveAttachment is NULL"));
     }
@@ -1541,6 +1852,33 @@ void Controller::ReadProgressiveAttachmentBy(ProgressiveReader* r) {
                          __FUNCTION__));
     }
     add_flag(FLAGS_PROGRESSIVE_READER);
+    if (progressive_read_timeout_ms() > 0) {
+        if (_request_protocol != PROTOCOL_HTTP ||
+            _progressive_read_socket_id == INVALID_SOCKET_ID) {
+            pthread_once(&s_ignore_all_read_once, CreateIgnoreAllRead);
+            _rpa->ReadProgressiveAttachmentBy(s_ignore_all_read);
+            return r->OnEndOfMessage(butil::Status(
+                ENOTSUP,
+                "Progressive read timeout is only supported for HTTP/1.x"));
+        }
+        ProgressiveTimeoutReader* reader = new (std::nothrow)
+            ProgressiveTimeoutReader(
+                _progressive_read_socket_id, _progressive_read_timeout_ms, r);
+        if (reader == nullptr) {
+            pthread_once(&s_ignore_all_read_once, CreateIgnoreAllRead);
+            _rpa->ReadProgressiveAttachmentBy(s_ignore_all_read);
+            return r->OnEndOfMessage(
+                butil::Status(ENOMEM, "Fail to create progressive timeout reader"));
+        }
+        const int rc = reader->Start();
+        if (rc != 0) {
+            pthread_once(&s_ignore_all_read_once, CreateIgnoreAllRead);
+            _rpa->ReadProgressiveAttachmentBy(s_ignore_all_read);
+            return reader->OnEndOfMessage(butil::Status(
+                rc, "Fail to add progressive read timeout timer: %s", berror(rc)));
+        }
+        return _rpa->ReadProgressiveAttachmentBy(reader);
+    }
     return _rpa->ReadProgressiveAttachmentBy(r);
 }
 
@@ -1550,12 +1888,12 @@ void Controller::set_mongo_session_data(MongoContext* data) {
 
 bool Controller::is_ssl() const {
     Socket* s = _current_call.sending_sock.get();
-    return s != NULL && s->is_ssl();
+    return s != nullptr && s->is_ssl();
 }
 
 x509_st* Controller::get_peer_certificate() const {
     Socket* s = _current_call.sending_sock.get();
-    return s ? s->GetPeerCertificate() : NULL;
+    return s ? s->GetPeerCertificate() : nullptr;
 }
 
 int Controller::GetSockOption(int level, int optname, void* optval, socklen_t* optlen) {
@@ -1582,9 +1920,9 @@ typedef sighandler_t SignalHandler;
 #endif
 
 static volatile bool s_signal_quit = false;
-static SignalHandler s_prev_sigint_handler = NULL;
-static SignalHandler s_prev_sigterm_handler = NULL;
-static SignalHandler s_prev_sighup_handler = NULL;
+static SignalHandler s_prev_sigint_handler = nullptr;
+static SignalHandler s_prev_sigterm_handler = nullptr;
+static SignalHandler s_prev_sighup_handler = nullptr;
 
 static void quit_handler(int signo) {
     s_signal_quit = true;
@@ -1711,6 +2049,26 @@ void Controller::DoPrintLogPrefix(std::ostream& os) const {
     if (FLAGS_log_as_json) {
         os << "\"M\":\"";
     }
+}
+
+
+ControllerPrivateAccessor& ControllerPrivateAccessor::set_span(
+    const std::shared_ptr<Span>& span) {
+    _cntl->_span = span;
+    return *this;
+}
+
+ControllerPrivateAccessor& ControllerPrivateAccessor::set_span(Span* span) {
+    if (span) {
+        _cntl->_span = span->shared_from_this();
+    } else {
+        _cntl->_span.reset();
+    }
+    return *this;
+}
+
+std::shared_ptr<Span> ControllerPrivateAccessor::span() const {
+    return _cntl->_span;
 }
 
 } // namespace brpc

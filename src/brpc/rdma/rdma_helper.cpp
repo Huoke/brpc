@@ -43,35 +43,37 @@ extern void  (*blockmem_deallocate)(void*);
 namespace brpc {
 namespace rdma {
 
-void* g_handle_ibverbs = NULL;
+void* g_handle_ibverbs = nullptr;
 bool g_skip_rdma_init = false;
 
-ibv_device** (*IbvGetDeviceList)(int*) = NULL;
-void (*IbvFreeDeviceList)(ibv_device**) = NULL;
-ibv_context* (*IbvOpenDevice)(ibv_device*) = NULL;
-int (*IbvCloseDevice)(ibv_context*) = NULL;
-const char* (*IbvGetDeviceName)(ibv_device*) = NULL;
-int (*IbvForkInit)(void) = NULL;
-int (*IbvQueryDevice)(ibv_context*, ibv_device_attr*) = NULL;
-int (*IbvQueryPort)(ibv_context*, uint8_t, ibv_port_attr*) = NULL;
-int (*IbvQueryGid)(ibv_context*, uint8_t, int, ibv_gid*) = NULL;
-ibv_pd* (*IbvAllocPd)(ibv_context*) = NULL;
-int (*IbvDeallocPd)(ibv_pd*) = NULL;
-ibv_cq* (*IbvCreateCq)(ibv_context*, int, void*, ibv_comp_channel*, int) = NULL;
-int (*IbvDestroyCq)(ibv_cq*) = NULL;
-ibv_qp* (*IbvCreateQp)(ibv_pd*, ibv_qp_init_attr*) = NULL;
-int (*IbvModifyQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask) = NULL;
-int (*IbvQueryQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask, ibv_qp_init_attr*) = NULL;
-int (*IbvDestroyQp)(ibv_qp*) = NULL;
-ibv_comp_channel* (*IbvCreateCompChannel)(ibv_context*) = NULL;
-int (*IbvDestroyCompChannel)(ibv_comp_channel*) = NULL;
-ibv_mr* (*IbvRegMr)(ibv_pd*, void*, size_t, ibv_access_flags) = NULL;
-int (*IbvDeregMr)(ibv_mr*) = NULL;
-int (*IbvGetCqEvent)(ibv_comp_channel*, ibv_cq**, void**) = NULL;
-void (*IbvAckCqEvents)(ibv_cq*, unsigned int) = NULL;
-int (*IbvGetAsyncEvent)(ibv_context*, ibv_async_event*) = NULL;
-void (*IbvAckAsyncEvent)(ibv_async_event*) = NULL;
-const char* (*IbvEventTypeStr)(ibv_event_type) = NULL;
+ibv_device** (*IbvGetDeviceList)(int*) = nullptr;
+void (*IbvFreeDeviceList)(ibv_device**) = nullptr;
+ibv_context* (*IbvOpenDevice)(ibv_device*) = nullptr;
+int (*IbvCloseDevice)(ibv_context*) = nullptr;
+const char* (*IbvGetDeviceName)(ibv_device*) = nullptr;
+int (*IbvForkInit)(void) = nullptr;
+int (*IbvQueryDevice)(ibv_context*, ibv_device_attr*) = nullptr;
+int (*IbvQueryPort)(ibv_context*, uint8_t, ibv_port_attr*) = nullptr;
+int (*IbvQueryGid)(ibv_context*, uint8_t, int, ibv_gid*) = nullptr;
+ibv_pd* (*IbvAllocPd)(ibv_context*) = nullptr;
+int (*IbvDeallocPd)(ibv_pd*) = nullptr;
+ibv_cq* (*IbvCreateCq)(ibv_context*, int, void*, ibv_comp_channel*, int) = nullptr;
+int (*IbvDestroyCq)(ibv_cq*) = nullptr;
+ibv_qp* (*IbvCreateQp)(ibv_pd*, ibv_qp_init_attr*) = nullptr;
+int (*IbvModifyQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask) = nullptr;
+int (*IbvQueryQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask, ibv_qp_init_attr*) = nullptr;
+int (*IbvDestroyQp)(ibv_qp*) = nullptr;
+ibv_comp_channel* (*IbvCreateCompChannel)(ibv_context*) = nullptr;
+int (*IbvDestroyCompChannel)(ibv_comp_channel*) = nullptr;
+ibv_mr* (*IbvRegMr)(ibv_pd*, void*, size_t, int) = nullptr;
+int (*IbvDeregMr)(ibv_mr*) = nullptr;
+int (*IbvGetCqEvent)(ibv_comp_channel*, ibv_cq**, void**) = nullptr;
+void (*IbvAckCqEvents)(ibv_cq*, unsigned int) = nullptr;
+int (*IbvGetAsyncEvent)(ibv_context*, ibv_async_event*) = nullptr;
+void (*IbvAckAsyncEvent)(ibv_async_event*) = nullptr;
+const char* (*IbvEventTypeStr)(ibv_event_type) = nullptr;
+int (*IbvQueryEce)(ibv_qp*, ibv_ece*) = nullptr;
+int (*IbvSetEce)(ibv_qp*, ibv_ece*) = nullptr;
 
 // NOTE:
 // ibv_post_send, ibv_post_recv, ibv_poll_cq, ibv_req_notify_cq are all inline function
@@ -95,18 +97,18 @@ DEFINE_int32(rdma_port, 1, "The port number to use. For RoCE, it is always 1.");
 DEFINE_int32(rdma_gid_index, -1, "The GID index to use. -1 means using the last one.");
 
 // static const size_t SYSFS_SIZE = 4096;
-static ibv_device** g_devices = NULL;
-static ibv_context* g_context = NULL;
+static ibv_device** g_devices = nullptr;
+static ibv_context* g_context = nullptr;
 static SocketId g_async_socket;
-static ibv_pd* g_pd = NULL;
-static std::vector<ibv_mr*>* g_mrs = NULL; // mr registered by brpc
+static ibv_pd* g_pd = nullptr;
+static std::vector<ibv_mr*>* g_mrs = nullptr; // mr registered by brpc
 
 static butil::FlatMap<void*, ibv_mr*>* g_user_mrs;  // mr registered by user
-static butil::Mutex* g_user_mrs_lock = NULL;
+static butil::Mutex* g_user_mrs_lock = nullptr;
 
 // Store the original IOBuf memalloc and memdealloc functions
-static void* (*g_mem_alloc)(size_t) = NULL;
-static void (*g_mem_dealloc)(void*) = NULL;
+static void* (*g_mem_alloc)(size_t) = nullptr;
+static void (*g_mem_dealloc)(void*) = nullptr;
 
 namespace {
 struct IbvDeviceDeleter {
@@ -139,42 +141,51 @@ static void GlobalRelease() {
         }
         g_user_mrs->clear();
         delete g_user_mrs;
-        g_user_mrs = NULL;
+        g_user_mrs = nullptr;
     }
     delete g_user_mrs_lock;
-    g_user_mrs_lock = NULL;
+    g_user_mrs_lock = nullptr;
 
     if (g_mrs) {
         for (size_t i = 0; i < g_mrs->size(); ++i) {
             IbvDeregMr((*g_mrs)[i]);
         }
         delete g_mrs;
-        g_mrs = NULL;
+        g_mrs = nullptr;
     }
 
     if (g_pd) {
         IbvDeallocPd(g_pd);
-        g_pd = NULL;
+        g_pd = nullptr;
     }
 
     if (g_context) {
         IbvCloseDevice(g_context);
-        g_context = NULL;
+        g_context = nullptr;
     }
 
     if (g_devices) {
         IbvFreeDeviceList(g_devices);
-        g_devices = NULL;
+        g_devices = nullptr;
     }
+}
+
+void* UserExtendBlockPool(void* region_base, size_t region_size,
+                          int block_type) {
+    return ExtendBlockPoolByUser(region_base, region_size, block_type);
 }
 
 uint32_t RdmaRegisterMemory(void* buf, size_t size) {
     // Register the memory as callback in block_pool
     // The thread-safety should be guaranteed by the caller
-    ibv_mr* mr = IbvRegMr(g_pd, buf, size, IBV_ACCESS_LOCAL_WRITE);
+    ibv_mr* mr = IbvRegMr(g_pd, buf, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING);
     if (!mr) {
-        PLOG(ERROR) << "Fail to register memory";
-        return 0;
+        PLOG(WARNING) << "Do not support IBV_ACCESS_RELAXED_ORDERING for RDMA!!!";
+        mr = IbvRegMr(g_pd, buf, size, IBV_ACCESS_LOCAL_WRITE);
+        if (!mr) {
+            PLOG(ERROR) << "Fail to register memory";
+            return 0;
+        }
     }
     g_mrs->push_back(mr);
     return mr->lkey;
@@ -183,7 +194,7 @@ uint32_t RdmaRegisterMemory(void* buf, size_t size) {
 static void* BlockAllocate(size_t len) {
     if (len == 0) {
         errno = EINVAL;
-        return NULL;
+        return nullptr;
     }
     void* ptr = AllocBlock(len);
     if (!ptr) {
@@ -203,7 +214,7 @@ void BlockDeallocate(void* buf) {
 
 static void FindRdmaLid() {
     ibv_port_attr attr;
-    if (IbvQueryPort(g_context, g_port_num, &attr) < 0) {
+    if (IbvQueryPort(g_context, g_port_num, &attr) != 0) {
         return;
     }
     g_lid = attr.lid;
@@ -215,7 +226,7 @@ static bool FindRdmaGid(ibv_context* context) {
     bool found = false;
     for (int i = g_gid_tbl_len - 1; i >= 0; --i) {
         ibv_gid gid;
-        if (IbvQueryGid(context, g_port_num, i, &gid) < 0) {
+        if (IbvQueryGid(context, g_port_num, i, &gid) != 0) {
             continue;
         }
         if (gid.global.interface_id == 0) {
@@ -245,7 +256,7 @@ static void OnRdmaAsyncEvent(Socket* m) {
     int progress = Socket::PROGRESS_INIT;
     do {
         ibv_async_event event;
-        if (IbvGetAsyncEvent(g_context, &event) < 0) {
+        if (IbvGetAsyncEvent(g_context, &event) != 0) {
             break;
         }
         LOG(WARNING) << "rdma async event: " << IbvEventTypeStr(event.event_type);
@@ -329,24 +340,39 @@ static void OnRdmaAsyncEvent(Socket* m) {
     } while (true);
 }
 
-#define LoadSymbol(handle, func, symbol) \
-    *(void**)(&func) = dlsym(handle, symbol); \
-    if (!func) { \
+#define LoadSymbol(handle, func, symbol)                 \
+    *(void**)(&func) = dlsym(handle, symbol);            \
+    if (!func) {                                         \
         LOG(ERROR) << "Fail to find symbol: " << symbol; \
-        return -1; \
+        return -1;                                       \
     }
 
+// Soft-load an OPTIONAL symbol: if the symbol is missing (e.g. the
+// installed libibverbs predates rdma-core v35 which introduced the ECE
+// APIs), leave the function pointer nullptr and continue instead of failing
+// the whole RDMA initialization. Callers MUST null-check before use.
+#define LoadSymbolOptional(handle, func, symbol) \
+    *(void**)(&func) = dlsym(handle, symbol);    \
+    LOG_IF(WARNING, func == nullptr)                \
+        << "Optional symbol not found (feature disabled): " << symbol;
+
 static int ReadRdmaDynamicLib() {
-    g_handle_ibverbs = dlopen("libibverbs.so", RTLD_LAZY);
-    if (!g_handle_ibverbs) {
-        LOG(WARNING) << "Failed to load libibverbs.so " << dlerror() << " try libibverbs.so.1";
-        // Clear existing error
-        dlerror();
-        g_handle_ibverbs = dlopen("libibverbs.so.1", RTLD_LAZY);
-        if (!g_handle_ibverbs) {
-            LOG(ERROR) << "Fail to load libibverbs.so.1 due to " << dlerror();
-            return -1;
+    const static char* const kRdmaLibs[] = {
+        "libibverbs.so",
+        "libibverbs.so.1"
+    };
+    for (const char* lib : kRdmaLibs) {
+        dlerror();  // Clear existing error
+        g_handle_ibverbs = dlopen(lib, RTLD_LAZY);
+        if (g_handle_ibverbs) {
+            LOG(INFO) << "Successfully loaded " << lib;
+            break;
         }
+        LOG(WARNING) << "Failed to load " << lib << ": " << dlerror();
+    }
+    if (!g_handle_ibverbs) {
+        LOG(ERROR) << "Failed to load any of the RDMA libraries";
+        return -1;
     }
 
     LoadSymbol(g_handle_ibverbs, IbvGetDeviceList, "ibv_get_device_list");
@@ -375,6 +401,12 @@ static int ReadRdmaDynamicLib() {
     LoadSymbol(g_handle_ibverbs, IbvGetAsyncEvent, "ibv_get_async_event");
     LoadSymbol(g_handle_ibverbs, IbvAckAsyncEvent, "ibv_ack_async_event");
     LoadSymbol(g_handle_ibverbs, IbvEventTypeStr, "ibv_event_type_str");
+    // ECE APIs were introduced in symbol version IBVERBS_1.10.
+    // Load them optionally so that running against an older
+    // libibverbs keeps RDMA working (ECE simply stays disabled)
+    // instead of failing the whole initialization.
+    LoadSymbolOptional(g_handle_ibverbs, IbvQueryEce, "ibv_query_ece");
+    LoadSymbolOptional(g_handle_ibverbs, IbvSetEce, "ibv_set_ece");
 
     return 0;
 }
@@ -405,7 +437,8 @@ static ibv_context* OpenDevice(int num_total, int* num_available_devices) {
             continue;
         }
         ibv_port_attr attr;
-        if (IbvQueryPort(context.get(), uint8_t(FLAGS_rdma_port), &attr) < 0) {
+        errno = IbvQueryPort(context.get(), uint8_t(FLAGS_rdma_port), &attr);
+        if (errno != 0) {
             PLOG(WARNING) << "Fail to query port " << FLAGS_rdma_port << " on "
                           << dev_name;
             continue;
@@ -489,7 +522,6 @@ static void GlobalRdmaInitializeOrDieImpl() {
     } else {
         LOG(INFO) << "RDMA GID Index: " << (int)g_gid_index;
     }
-    IbvCreateCompChannel(g_context);
 
     // Create protection domain
     g_pd = IbvAllocPd(g_context);
@@ -498,31 +530,16 @@ static void GlobalRdmaInitializeOrDieImpl() {
         ExitWithError();
     }
 
-    g_user_mrs_lock = new (std::nothrow) butil::Mutex;
-    if (!g_user_mrs_lock) {
-        PLOG(WARNING) << "Fail to construct g_user_mrs_lock";
-        ExitWithError();
-    }
-
-    g_user_mrs = new (std::nothrow) butil::FlatMap<void*, ibv_mr*>();
-    if (!g_user_mrs) {
-        PLOG(WARNING) << "Fail to construct g_user_mrs";
-        ExitWithError();
-    }
-
+    g_user_mrs_lock = new butil::Mutex;
+    g_user_mrs = new butil::FlatMap<void*, ibv_mr*>();
     if (g_user_mrs->init(65536) < 0) {
         PLOG(WARNING) << "Fail to initialize g_user_mrs";
         ExitWithError();
     }
-
-    g_mrs = new (std::nothrow) std::vector<ibv_mr*>;
-    if (!g_mrs) {
-        PLOG(ERROR) << "Fail to allocate a RDMA MR list";
-        ExitWithError();
-    }
+    g_mrs = new std::vector<ibv_mr*>;
 
     ibv_device_attr attr;
-    if (IbvQueryDevice(g_context, &attr) < 0) {
+    if (IbvQueryDevice(g_context, &attr) != 0) {
         PLOG(ERROR) << "Fail to get the device information";
         ExitWithError();
     }
@@ -535,6 +552,7 @@ static void GlobalRdmaInitializeOrDieImpl() {
     }
 
     // Initialize RDMA memory pool (block_pool)
+    butil::SetDefaultBlockSize(GetRdmaBlockSize());
     if (!InitBlockPool(RdmaRegisterMemory)) {
         PLOG(ERROR) << "Fail to initialize RDMA memory pool";
         ExitWithError();
@@ -579,10 +597,14 @@ void GlobalRdmaInitializeOrDie() {
 }
 
 uint32_t RegisterMemoryForRdma(void* buf, size_t len) {
-    ibv_mr* mr = IbvRegMr(g_pd, buf, len, IBV_ACCESS_LOCAL_WRITE);
+    ibv_mr* mr = IbvRegMr(g_pd, buf, len, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING);
     if (!mr) {
-        PLOG(ERROR) << "Fail to register memory";
-        return 0;
+        PLOG(WARNING) << "Do not support IBV_ACCESS_RELAXED_ORDERING for RDMA!!!";
+        mr = IbvRegMr(g_pd, buf, len, IBV_ACCESS_LOCAL_WRITE);
+        if (!mr) {
+            PLOG(ERROR) << "Fail to register memory";
+            return 0;
+        }
     }
     {
         BAIDU_SCOPED_LOCK(*g_user_mrs_lock);
@@ -600,7 +622,7 @@ uint32_t RegisterMemoryForRdma(void* buf, size_t len) {
 }
 
 void DeregisterMemoryForRdma(void* buf) {
-    ibv_mr* mr = NULL;
+    ibv_mr* mr = nullptr;
     {
         BAIDU_SCOPED_LOCK(*g_user_mrs_lock);
         ibv_mr** mr_ptr = g_user_mrs->seek(buf);

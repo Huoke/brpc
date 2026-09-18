@@ -21,6 +21,7 @@
 #include "butil/macros.h"
 #include "butil/scoped_lock.h"
 #include "bthread/work_stealing_queue.h"
+#include "bthread/processor.h"
 
 namespace {
 typedef size_t value_type;
@@ -39,13 +40,7 @@ void* steal_thread(void* arg) {
         if (q->steal(&val)) {
             stolen->push_back(val);
         } else {
-#if defined(ARCH_CPU_ARM_FAMILY)
-            asm volatile("yield\n": : :"memory");
-#elif defined(ARCH_CPU_LOONGARCH64_FAMILY)
-            asm volatile("nop\n": : :"memory");
-#else
-            asm volatile("pause\n": : :"memory");
-#endif
+            cpu_relax();
         }
     }
     return stolen;
@@ -68,7 +63,7 @@ void* push_thread(void* arg) {
             }
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 void* pop_thread(void* arg) {
@@ -95,24 +90,24 @@ TEST(WSQTest, sanity) {
     pthread_t rth[8];
     pthread_t wth, pop_th;
     for (size_t i = 0; i < ARRAY_SIZE(rth); ++i) {
-        ASSERT_EQ(0, pthread_create(&rth[i], NULL, steal_thread, &q));
+        ASSERT_EQ(0, pthread_create(&rth[i], nullptr, steal_thread, &q));
     }
-    ASSERT_EQ(0, pthread_create(&wth, NULL, push_thread, &q));
-    ASSERT_EQ(0, pthread_create(&pop_th, NULL, pop_thread, &q));
+    ASSERT_EQ(0, pthread_create(&wth, nullptr, push_thread, &q));
+    ASSERT_EQ(0, pthread_create(&pop_th, nullptr, pop_thread, &q));
 
     std::vector<value_type> values;
     values.reserve(N);
     size_t nstolen = 0, npopped = 0;
     for (size_t i = 0; i < ARRAY_SIZE(rth); ++i) {
-        std::vector<value_type>* res = NULL;
+        std::vector<value_type>* res = nullptr;
         pthread_join(rth[i], (void**)&res);
         for (size_t j = 0; j < res->size(); ++j, ++nstolen) {
             values.push_back((*res)[j]);
         }
         delete res;
     }
-    pthread_join(wth, NULL);
-    std::vector<value_type>* res = NULL;
+    pthread_join(wth, nullptr);
+    std::vector<value_type>* res = nullptr;
     pthread_join(pop_th, (void**)&res);
     for (size_t j = 0; j < res->size(); ++j, ++npopped) {
         values.push_back((*res)[j]);

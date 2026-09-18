@@ -23,6 +23,7 @@
 #include "brpc/socket.h"              // SocketId, SocketUser
 #include "brpc/parse_result.h"        // ParseResult
 #include "brpc/input_message_base.h"  // InputMessageBase
+#include "brpc/input_messenger_processor.h"  // InputMessengerProcessor
 
 
 namespace brpc {
@@ -30,6 +31,15 @@ namespace rdma {
 class RdmaEndpoint;
 }
 
+namespace urma {
+class UrmaEndpoint;
+}
+
+namespace ubring {
+class UBShmEndpoint;
+}
+class TcpTransport;
+class RdmaTransport;
 struct InputMessageHandler {
     // The callback to cut a message from `source'.
     // Returned message will be passed to process_request or process_response
@@ -57,7 +67,7 @@ struct InputMessageHandler {
     Process process;
 
     // The callback to verify authentication of this socket. Only called
-    // on the first message that a socket receives. Can be NULL when 
+    // on the first message that a socket receives. Can be nullptr when 
     // authentication is not needed or this is the client side.
     // Returns true on successful authentication.
     typedef bool (*Verify)(const InputMessageBase* msg);
@@ -70,10 +80,32 @@ struct InputMessageHandler {
     const char* name;
 };
 
+class InputMessageClosure {
+public:
+    InputMessageClosure() : _msg(nullptr) { }
+    ~InputMessageClosure() noexcept(false);
+
+    InputMessageBase* release() {
+        InputMessageBase* m = _msg;
+        _msg = nullptr;
+        return m;
+    }
+
+    void reset(InputMessageBase* m);
+
+private:
+    InputMessageBase* _msg;
+};
+
 // Process messages from connections.
 // `Message' corresponds to a client's request or a server's response.
 class InputMessenger : public SocketUser {
+friend class TcpTransport;
+friend class RdmaTransport;
 friend class rdma::RdmaEndpoint;
+friend class urma::UrmaEndpoint;
+friend class ubring::UBShmEndpoint;
+friend class InputMessengerProcessor;
 public:
     explicit InputMessenger(size_t capacity = 128);
     ~InputMessenger();
@@ -111,33 +143,6 @@ protected:
     static void OnNewMessages(Socket* m);
     
 private:
-    class InputMessageClosure {
-    public:
-        InputMessageClosure() : _msg(NULL) { }
-        ~InputMessageClosure() noexcept(false);
-
-        InputMessageBase* release() {
-            InputMessageBase* m = _msg;
-            _msg = NULL;
-            return m;
-        }
-
-        void reset(InputMessageBase* m);
-
-    private:
-        InputMessageBase* _msg;
-    };
-
-    // Find a valid scissor from `handlers' to cut off `header' and `payload'
-    // from m->read_buf, save index of the scissor into `index'.
-    ParseResult CutInputMessage(Socket* m, size_t* index, bool read_eof);
-
-    // Process a new message just received in OnNewMessages
-    // Return value >= 0 means success
-    int ProcessNewMessage(
-            Socket* m, ssize_t bytes, bool read_eof,
-            const uint64_t received_us, const uint64_t base_realtime,
-            InputMessageClosure& last_msg);
 
     // User-supplied scissors and handlers.
     // the index of handler is exactly the same as the protocol

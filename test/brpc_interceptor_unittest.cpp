@@ -38,7 +38,6 @@ int main(int argc, char* argv[]) {
 
 const int EREJECT = 4000;
 int g_index = 0;
-const int port = 8613;
 const std::string EXP_REQUEST = "hello";
 const std::string EXP_RESPONSE = "world";
 const std::string NSHEAD_EXP_RESPONSE = "error";
@@ -108,7 +107,7 @@ public:
         options.interceptor = new MyInterceptor;
         options.nshead_service = new MyNsheadProtocol;
         options.server_owns_interceptor = true;
-        EXPECT_EQ(0, _server.Start(port, &options));
+        EXPECT_EQ(0, _server.Start(0, &options));
     }
 
     ~InterceptorTest() override = default;
@@ -118,7 +117,7 @@ public:
                            ::test::EchoResponse& res) {
         for (g_index = 0; g_index < 1000; ++g_index) {
             brpc::Controller cntl;
-            stub.Echo(&cntl, &req, &res, NULL);
+            stub.Echo(&cntl, &req, &res, nullptr);
             if (g_index % 2 == 0) {
                 ASSERT_TRUE(cntl.Failed());
                 ASSERT_EQ(EREJECT, cntl.ErrorCode());
@@ -143,7 +142,7 @@ TEST_F(InterceptorTest, sanity) {
     {
         brpc::Channel channel;
         brpc::ChannelOptions options;
-        ASSERT_EQ(0, channel.Init("localhost", port, &options));
+        ASSERT_EQ(0, channel.Init(_server.listen_address(), &options));
         test::EchoService_Stub stub(&channel);
         CallMethod(stub, req, res);
     }
@@ -153,7 +152,7 @@ TEST_F(InterceptorTest, sanity) {
         brpc::Channel channel;
         brpc::ChannelOptions options;
         options.protocol = brpc::PROTOCOL_HTTP;
-        ASSERT_EQ(0, channel.Init("localhost", port, &options));
+        ASSERT_EQ(0, channel.Init(_server.listen_address(), &options));
         test::EchoService_Stub stub(&channel);
         // Set the x-bd-error-code header of http response to brpc error code.
         brpc::policy::FLAGS_use_http_error_code = true;
@@ -165,7 +164,7 @@ TEST_F(InterceptorTest, sanity) {
         brpc::Channel channel;
         brpc::ChannelOptions options;
         options.protocol = brpc::PROTOCOL_HULU_PBRPC;
-        ASSERT_EQ(0, channel.Init("localhost", port, &options));
+        ASSERT_EQ(0, channel.Init(_server.listen_address(), &options));
         test::EchoService_Stub stub(&channel);
         CallMethod(stub, req, res);
     }
@@ -175,7 +174,7 @@ TEST_F(InterceptorTest, sanity) {
         brpc::Channel channel;
         brpc::ChannelOptions options;
         options.protocol = brpc::PROTOCOL_SOFA_PBRPC;
-        ASSERT_EQ(0, channel.Init("localhost", port, &options));
+        ASSERT_EQ(0, channel.Init(_server.listen_address(), &options));
         test::EchoService_Stub stub(&channel);
         CallMethod(stub, req, res);
     }
@@ -185,12 +184,12 @@ TEST_F(InterceptorTest, sanity) {
         brpc::Channel channel;
         brpc::ChannelOptions options;
         options.protocol = brpc::PROTOCOL_NSHEAD;
-        ASSERT_EQ(0, channel.Init("localhost", port, &options));
+        ASSERT_EQ(0, channel.Init(_server.listen_address(), &options));
         brpc::NsheadMessage request;
         for (g_index = 0; g_index < 1000; ++g_index) {
             brpc::Controller cntl;
             brpc::NsheadMessage response;
-            channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+            channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
             if (g_index % 2 == 0) {
                 ASSERT_EQ(NSHEAD_EXP_RESPONSE, response.body.to_string());
             } else {

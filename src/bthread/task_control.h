@@ -41,6 +41,7 @@ DECLARE_int32(task_group_ntags);
 namespace bthread {
 
 class TaskGroup;
+struct CumulatedWithTagArgs;
 
 // Control all task groups
 class TaskControl {
@@ -79,7 +80,7 @@ public:
     void print_rq_sizes(std::ostream& os);
 
     double get_cumulated_worker_time();
-    double get_cumulated_worker_time_with_tag(bthread_tag_t tag);
+    double get_cumulated_worker_time(bthread_tag_t tag);
     int64_t get_cumulated_switch_count();
     int64_t get_cumulated_signal_count();
 
@@ -88,8 +89,17 @@ public:
     int add_workers(int num, bthread_tag_t tag);
 
     // Choose one TaskGroup (randomly right now).
-    // If this method is called after init(), it never returns NULL.
+    // If this method is called after init(), it never returns nullptr.
     TaskGroup* choose_one_group(bthread_tag_t tag);
+
+    // Parse FLAGS_cpu_set into _tag_cpus.  Two formats are accepted:
+    //   Legacy (all tags share one set): "0-3,5,7"
+    //   Per-tag:  "0:0-3,5,7;1:6-9,4"
+    // Tags not mentioned get an empty cpu list (= no binding).
+    // Returns -1 on parse error.
+    int parse_cpuset(const std::string& value);
+
+    static void bind_thread_to_cpu(pthread_t pthread, unsigned cpu_id);
 
 #ifdef BRPC_BTHREAD_TRACER
     // A stacktrace of bthread can be helpful in debugging.
@@ -97,14 +107,16 @@ public:
     std::string stack_trace(bthread_t tid);
 #endif // BRPC_BTHREAD_TRACER
 
-    void push_priority_queue(bthread_tag_t tag, bthread_t tid) {
-        _priority_queues[tag].push(tid);
+    void push_ed_priority_queue(
+            bthread_tag_t tag, int priority_index, bthread_t tid) {
+        ed_priority_queue(tag, priority_index).push(tid);
     }
+
+    std::vector<bthread_t> get_living_bthreads();
 
 private:
     typedef std::array<TaskGroup*, BTHREAD_MAX_CONCURRENCY> TaggedGroups;
-    static const int PARKING_LOT_NUM = 4;
-    typedef std::array<ParkingLot, PARKING_LOT_NUM> TaggedParkingLot;
+    typedef std::array<ParkingLot, BTHREAD_MAX_PARKINGLOT> TaggedParkingLot;
     // Add/Remove a TaskGroup.
     // Returns 0 on success, -1 otherwise.
     int _add_group(TaskGroup*, bthread_tag_t tag);
@@ -117,7 +129,16 @@ private:
     butil::atomic<size_t>& tag_ngroup(int tag) { return _tagged_ngroup[tag]; }
 
     // Tag parking slot
-    TaggedParkingLot& tag_pl(bthread_tag_t tag) { return _pl[tag]; }
+    TaggedParkingLot& tag_pl(bthread_tag_t tag) { return _tagged_pl[tag]; }
+
+    // Priority queue for a specific ED within a tag
+    WorkStealingQueue<bthread_t>& ed_priority_queue(
+            bthread_tag_t tag, int index) {
+        return _ed_priority_queues[
+            tag * _ed_priority_queue_num_of_each_tag + index];
+    }
+
+    int init_ed_priority_queues();
 
     static void delete_task_group(void* arg);
 
@@ -139,8 +160,6 @@ private:
     bool _stop;
     butil::atomic<int> _concurrency;
     std::vector<pthread_t> _workers;
-    butil::atomic<int> _next_worker_id;
-
     bvar::Adder<int64_t> _nworkers;
     butil::Mutex _pending_time_mutex;
     butil::atomic<bvar::LatencyRecorder*> _pending_time;
@@ -153,13 +172,27 @@ private:
     bvar::PassiveStatus<std::string> _status;
     bvar::Adder<int64_t> _nbthreads;
 
-    std::vector<bvar::Adder<int64_t>*> _tagged_nworkers;
-    std::vector<bvar::PassiveStatus<double>*> _tagged_cumulated_worker_time;
-    std::vector<bvar::PerSecond<bvar::PassiveStatus<double>>*> _tagged_worker_usage_second;
-    std::vector<bvar::Adder<int64_t>*> _tagged_nbthreads;
-    std::vector<WorkStealingQueue<bthread_t>> _priority_queues;
+    std::vector<std::unique_ptr<bvar::Adder<int64_t>>> _tagged_nworkers;
+    std::vector<std::unique_ptr<CumulatedWithTagArgs>>
+        _tagged_cumulated_worker_time_args;
+    std::vector<std::unique_ptr<bvar::PassiveStatus<double>>>
+        _tagged_cumulated_worker_time;
+    std::vector<std::unique_ptr<bvar::PerSecond<bvar::PassiveStatus<double>>>>
+        _tagged_worker_usage_second;
+    std::vector<std::unique_ptr<bvar::Adder<int64_t>>> _tagged_nbthreads;
 
-    std::vector<TaggedParkingLot> _pl;
+    bool _enable_priority_queue;
+    int _ed_priority_queue_num_of_each_tag;
+    std::vector<WorkStealingQueue<bthread_t>> _ed_priority_queues;
+
+    size_t _pl_num_of_each_tag;
+    std::vector<TaggedParkingLot> _tagged_pl;
+    // Per-tag CPU binding lists.  _tag_cpus[tag] is the round-robin list of
+    // CPU IDs to which workers of that tag are bound.  Empty means no binding.
+    std::vector<std::vector<unsigned>> _tag_cpus;
+    // Per-tag monotonic counter for round-robin CPU assignment.
+    // Incremented once per worker created for that tag (in worker_thread).
+    std::vector<butil::atomic<int>> _tag_next_worker_id;
 
 #ifdef BRPC_BTHREAD_TRACER
     TaskTracer _task_tracer;

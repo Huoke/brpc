@@ -7,6 +7,8 @@
 # Quick facts
 
 - Channel.Init() is not thread-safe.
+- A Channel can be initialized successfully only once. Failed Init() calls may
+  be retried.
 - Channel.CallMethod() is thread-safe and a Channel can be used by multiple threads simultaneously.
 - Channel can be put on stack.
 - Channel can be destructed just after sending asynchronous request.
@@ -23,7 +25,7 @@ Some RPC implementations have so-called "ClientManager", including configuration
 2. Share resources. For example, servers and channels in brpc share background workers (of bthread).
 3. Better management of Lifetime. Destructing a "ClientManager" is very error-prone, which is managed by brpc right now.
 
-Like most classes, Channel must be **Init()**-ed before usage. Parameters take default values when `options` is NULL. If you want non-default values, code as follows:
+Like most classes, Channel must be **Init()**-ed before usage. Parameters take default values when `options` is nullptr. If you want non-default values, code as follows:
 ```c++
 brpc::ChannelOptions options;  // including default values
 options.xxx = yyy;
@@ -32,12 +34,16 @@ channel.Init(..., &options);
 ```
 Note that Channel neither modifies `options` nor accesses `options` after completion of Init(), thus options can be put on stack safely as in above code. Channel.options() gets options being used by the Channel.
 
+Init() may be retried after a failure. Once it succeeds, the Channel's target
+and options are fixed and every later Init() call returns -1. Create a new
+Channel to use a different target or configuration.
+
 Init() can connect one server or a cluster(multiple servers).
 
 # Connect to a server
 
 ```c++
-// Take default values when options is NULL.
+// Take default values when options is nullptr.
 int Init(EndPoint server_addr_and_port, const ChannelOptions* options);
 int Init(const char* server_addr_and_port, const ChannelOptions* options);
 int Init(const char* server_addr, int port, const ChannelOptions* options);
@@ -64,7 +70,7 @@ Channels created by above Init() get server list from the NamingService specifie
 
 You **should not** create such channels ad-hocly each time before a RPC, because creation and destroying of such channels relate to many resources, say NamingService needs to be accessed once at creation otherwise server candidates are unknown. On the other hand, channels are able to be shared by multiple threads safely and has no need to be created frequently.
 
-If `load_balancer_name` is NULL or empty, this Init() is just the one for connecting single server and `naming_service_url` should be "ip:port" or "host:port" of the server. Thus you can unify initialization of all channels with this Init(). For example, you can put values of `naming_service_url` and `load_balancer_name` in configuration file, and set `load_balancer_name` to empty for single server and a valid algorithm for a cluster.
+If `load_balancer_name` is nullptr or empty, this Init() is just the one for connecting single server and `naming_service_url` should be "ip:port" or "host:port" of the server. Thus you can unify initialization of all channels with this Init(). For example, you can put values of `naming_service_url` and `load_balancer_name` in configuration file, and set `load_balancer_name` to empty for single server and a valid algorithm for a cluster.
 
 ## Naming Service
 
@@ -206,7 +212,7 @@ struct ServerNode {
 ```
 The most common usage is filtering by server tags.
 
-Customized filter is set to ChannelOptions to take effects. NULL by default means not filter.
+Customized filter is set to ChannelOptions to take effects. nullptr by default means not filter.
 
 ```c++
 class MyNamingServiceFilter : public brpc::NamingServiceFilter {
@@ -258,6 +264,10 @@ Requirements of instance tag is the same as wrr.
 
 which is locality-aware. Perfer servers with lower latencies, until the latency is higher than others, no other settings. Check out [Locality-aware load balancing](lalb.md) for more details.
 
+### p2c
+
+which is power-of-two-choices with peak-EWMA latency scoring. Each selection samples two random servers and routes to the one with the lower `latency * (inflight + 1) / weight` score, where the latency is a peak-sensitive moving average: an upward spike takes effect immediately while recovery decays over `tau_ms`(default 10s). A slow or failing server is shed within one observation and selection cost is O(1) regardless of cluster size. Weight comes from the instance tag as in wrr(default 1). Optional parameters: `p2c:choices=4`(compare 4 sampled servers instead of 2, useful when many servers degrade at once), `p2c:tau_ms=5000`.
+
 ### c_murmurhash or c_md5
 
 which is consistent hashing. Adding or removing servers does not make destinations of requests change as dramatically as in simple hashing. It's especially suitable for caching services.
@@ -268,9 +278,15 @@ Need to set Controller.set_request_code() before RPC otherwise the RPC will fail
 
 Do distinguish "key" and "attributes" of the request. Don't compute request_code by full content of the request just for quick. Minor change in attributes may result in totally different hash code and change destination dramatically. Another cause is padding, for example: `struct Foo { int32_t a; int64_t b; }` has a 4-byte undefined gap between `a` and `b` on 64-bit machines, result of `hash(&foo, sizeof(foo))` is undefined. Fields need to be packed or serialized before hashing.
 
+Number of virtual nodes per server defaults to -chash_num_replicas(default 100) and can be overridden per channel: `c_murmurhash:replicas=300`.
+
 Check out [Consistent Hashing](consistent_hashing.md) for more details.
 
 Other kind of lb does not need to set Controller.set_request_code(). If request code is set, it will not be used by lb. For example, lb=rr, and call Controller.set_request_code(), even if request_code is the same for every request, lb will balance the requests using the rr policy.
+
+### c_murmurhash_bl
+
+which is consistent hashing with bounded loads("Consistent Hashing with Bounded Loads", Mirrokni et al., CACM 2017). The hash ring is identical to `c_murmurhash`, but each server additionally has a capacity of `ceil(load_factor * average in-flight requests)`. When the hashed-to server is at capacity, the request overflows clockwise to the next server on the ring with spare capacity, so a hot key no longer saturates a single server while overflowed requests always land on the same ring successors, which keeps caches effective. The default factor comes from -chash_bounded_load_factor(default 1.25, must be > 1) and can be overridden per channel: `c_murmurhash_bl:load_factor=1.5`. The `replicas` parameter is supported as in `c_murmurhash`.
 
 ### Client-side throttling for recovery from cluster downtime
 
@@ -302,7 +318,7 @@ Or even:
 ```c++
 XXX_Stub(&channel).some_method(controller, request, response, done);
 ```
-A exception is http/h2 client, which is not related to protobuf much. Call CallMethod directly to make a http call, setting all parameters to NULL except for `Controller` and `done`, check [Access http/h2](http_client.md) for details.
+A exception is http/h2 client, which is not related to protobuf much. Call CallMethod directly to make a http call, setting all parameters to nullptr except for `Controller` and `done`, check [Access http/h2](http_client.md) for details.
 
 ## Synchronous call
 
@@ -317,7 +333,7 @@ XXX_Stub stub(&channel);
 
 request.set_foo(...);
 cntl.set_timeout_ms(...);
-stub.some_method(&cntl, &request, &response, NULL);
+stub.some_method(&cntl, &request, &response, nullptr);
 if (cntl.Failed()) {
     // RPC failed. fields in response are undefined, don't use.
 } else {
@@ -717,8 +733,9 @@ Another solution is setting gflag -defer_close_second
 | Name               | Value | Description                              | Defined At              |
 | ------------------ | ----- | ---------------------------------------- | ----------------------- |
 | defer_close_second | 0     | Defer close of connections for so many seconds even if the connection is not used by anyone. Close immediately for non-positive values | src/brpc/socket_map.cpp |
+| defer_close_respect_idle | false | When defer_close_second > 0, close a connection immediately when the last reference is removed and the socket has already been idle for longer than defer_close_second | src/brpc/socket_map.cpp |
 
-After setting, connection is not closed immediately after last referential count, instead it will be closed after so many seconds. If a channel references the connection again during the wait, the connection resumes to normal. No matter how frequent channels are created, this flag limits the frequency of closing connections. Side effect of the flag is that file descriptors are not closed immediately after destroying of channels, if the flag is wrongly set to be large, number of active file descriptors in the process may be large as well.
+After setting, connection is not closed immediately after last referential count, instead it will be closed after so many seconds. If a channel references the connection again during the wait, the connection resumes to normal. No matter how frequent channels are created, this flag limits the frequency of closing connections. Side effect of the flag is that file descriptors are not closed immediately after destroying of channels, if the flag is wrongly set to be large, number of active file descriptors in the process may be large as well. When -defer_close_respect_idle is enabled, a connection that has already been idle for longer than defer_close_second may be closed when the last reference is removed.
 
 ## Buffer size of connections
 

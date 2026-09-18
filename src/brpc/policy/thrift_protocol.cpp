@@ -184,9 +184,21 @@ void ReadThriftException(const butil::IOBuf& body,
             ::apache::thrift::transport::TMemoryBuffer::TAKE_OWNERSHIP);
     apache::thrift::protocol::TBinaryProtocolT<apache::thrift::transport::TMemoryBuffer> iprot(in_buffer);
 
-    x->read(&iprot);
-    iprot.readMessageEnd();
-    iprot.getTransport()->readEnd();
+    // A malformed exception struct may make the underlying thrift code throw
+    // (e.g. TProtocolException on a bad field or TTransportException /
+    // std::length_error on a bad length). Such an exception must be contained
+    // here: if it propagated out, it would unwind through ProcessThriftResponse
+    // up to the bthread task frame and call std::terminate(), taking down the
+    // whole process along with every other in-flight RPC on it.
+    try {
+        x->read(&iprot);
+        iprot.readMessageEnd();
+        iprot.getTransport()->readEnd();
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "Caught thrift exception while parsing T_EXCEPTION reply: " << e.what();
+    } catch (...) {
+        LOG(WARNING) << "Caught unknown thrift exception while parsing T_EXCEPTION reply";
+    }
 }
 
 // The continuation of request processing. Namely send response back to client.
@@ -243,13 +255,13 @@ void ThriftClosure::DoRun() {
     const Server* server = _controller.server();
 
     ControllerPrivateAccessor accessor(&_controller);
-    Span* span = accessor.span();
+    auto span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
     Socket* sock = accessor.get_sending_socket();
     MethodStatus* method_status = (server->options().thrift_service ?
-        server->options().thrift_service->_status : NULL);
+        server->options().thrift_service->_status : nullptr);
     ConcurrencyRemover concurrency_remover(method_status, &_controller, _received_us);
     if (!method_status) {
         // Judge errors belongings.
@@ -492,11 +504,14 @@ void ProcessThriftRequest(InputMessageBase* msg_base) {
     cntl->set_log_id(seq_id);    // Pass seq_id by log_id
 
     ThriftService* service = server->options().thrift_service;
-    if (service == NULL) {
+    if (service == nullptr) {
         LOG_EVERY_SECOND(ERROR)
             << "Received thrift request however the server does not set"
             " ServerOptions.thrift_service, close the connection.";
         return cntl->SetFailed(EINTERNAL, "ServerOptions.thrift_service is NULL");
+    }
+    if (RejectNonBuiltinAccessFromInternalPort(cntl, *server)) {
+        return;
     }
 
     // Switch to service-specific error.
@@ -515,7 +530,7 @@ void ProcessThriftRequest(InputMessageBase* msg_base) {
         bthread_assign_data((void*)&server->thread_local_options());
     }
 
-    Span* span = NULL;
+    std::shared_ptr<Span> span;
     if (IsTraceable(false)) {
         span = Span::CreateServerSpan(0, 0, 0, msg->base_real_us());
         accessor.set_span(span);
@@ -575,7 +590,7 @@ void ProcessThriftResponse(InputMessageBase* msg_base) {
     
     // Fetch correlation id that we saved before in `PacThriftRequest'
     const CallId cid = { static_cast<uint64_t>(msg->socket()->correlation_id()) };
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -584,8 +599,7 @@ void ProcessThriftResponse(InputMessageBase* msg_base) {
     }
 
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->payload.length());
@@ -657,13 +671,13 @@ bool VerifyThriftRequest(const InputMessageBase* msg_base) {
 
 void SerializeThriftRequest(butil::IOBuf* request_buf, Controller* cntl,
                             const google::protobuf::Message* req_base) {
-    if (req_base == NULL) {
+    if (req_base == nullptr) {
         return cntl->SetFailed(EREQUEST, "request is NULL");
     }
     if (req_base->GetDescriptor() != ThriftFramedMessage::descriptor()) {
         return cntl->SetFailed(EINVAL, "Type of request must be ThriftFramedMessage");
     }
-    if (cntl->response() != NULL &&
+    if (cntl->response() != nullptr &&
         cntl->response()->GetDescriptor() != ThriftFramedMessage::descriptor()) {
         return cntl->SetFailed(EINVAL, "Type of response must be ThriftFramedMessage");
     }
@@ -752,8 +766,7 @@ void PackThriftRequest(
     // pack the field.
     accessor.get_sending_socket()->set_correlation_id(correlation_id);
 
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_request_size(request.length());
         // TODO: Nowhere to set tracing ids.
         // request_meta->set_trace_id(span->trace_id());

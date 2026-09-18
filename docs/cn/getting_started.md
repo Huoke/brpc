@@ -121,6 +121,19 @@ $ ./echo_client
 $ mkdir build && cd build && cmake -DBUILD_UNIT_TESTS=ON .. && make && make test
 ```
 
+### 使用 Bazel 编译 brpc
+
+bRPC 也支持 Bazel 构建。`example/build_with_bazel_module` 下的 bzlmod 示例会基于本地
+bRPC 源码构建 server 和 client：
+
+```shell
+$ cd example/build_with_bazel_module
+$ bazel build //:echo_c++_server //:echo_c++_client
+```
+
+如果要把 bRPC 作为 Bazel 依赖使用，包括需要配置的 registry 和 `MODULE.bazel`，
+请参考 [Bazel 支持](bazel_support.md)。
+
 ## Fedora/CentOS
 
 ### 依赖准备
@@ -260,7 +273,7 @@ brew install gperftools
 
 如果你要运行测试，需安装gtest。先运行`brew install googletest`看看homebrew是否支持（老版本没有），没有的话请下载和编译googletest：
 ```shell
-git clone https://github.com/google/googletest -b release-1.10.0 && cd googletest/googletest && mkdir build && cd build && cmake -DCMAKE_CXX_FLAGS="-std=c++11" .. && make
+git clone https://github.com/google/googletest -b release-1.10.0 && cd googletest/googletest && mkdir build && cd build && cmake -DCMAKE_CXX_FLAGS="-std=c++14" .. && make
 ```
 在编译完成后，复制`include/`和`lib/`目录到`/usr/local/include`和`/usr/local/lib`目录中，以便于让所有应用都能使用gtest。
 
@@ -269,6 +282,42 @@ Monterey中openssl的安装位置可能不再位于`/usr/local/opt/openssl`，�
 
 * 先运行`brew link openssl --force`看看`/usr/local/opt/openssl`是否出现了
 * 没有的话可以自行设置软链：`sudo ln -s /opt/homebrew/Cellar/openssl@3/3.0.3 /usr/local/opt/openssl`。请注意此命令中openssl的目录可能随环境变化而变化，可通过`brew info openssl`查看。
+
+### 使用 CMake 编译 Debug 版 brpc
+
+Apple Silicon 可以使用 Homebrew 安装的依赖编译 Debug 版本：
+
+```shell
+cmake -S . -B build-debug -G "Unix Makefiles" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DDEBUG=ON \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build build-debug --parallel
+```
+
+该命令使用单配置的Unix Makefiles生成器，因此`CMAKE_BUILD_TYPE=Debug`会选择
+CMake的Debug构建配置。`DEBUG=ON`启用brpc的调试日志并保留断言。构建产物位于
+`build-debug/output/`。
+
+如需为 clangd 等工具生成编译数据库，请在配置命令中添加以下可选项：
+
+```shell
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+```
+
+生成的编译数据库位于 `build-debug/compile_commands.json`。
+
+如果 CMake 报错 `tapi error: malformed file`，请确认 Command Line Tools 与 Xcode
+版本一致，并选择当前安装的 Xcode：
+
+```shell
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+```
+
+如果问题仍然存在，请检查`xcrun --sdk macosx --show-sdk-path`返回的SDK路径是否有效。
 
 ### 使用config_brpc.sh编译brpc
 git克隆brpc，进入到项目目录然后运行：
@@ -324,13 +373,13 @@ $ docker run -it brpc:master /bin/bash
 
 # 支持的依赖
 
-## GCC: 4.8-11.2
+## GCC: 5.0-11.2
 
 **推荐 8.2 及以上版本。**
 
-默认启用 c++11，以去除对 boost 的依赖（比如 atomic）。
+默认启用 c++14，以去除对 boost 的依赖（比如 atomic）。
 
-理论支持 c++11 的编译器都应可以，但部分编译器版本对 c++11 的支持存在问题。目前 GCC 4.8 可支持编译的最高版本为 1.5.0。
+理论支持 c++14 的编译器都应可以，但部分编译器版本对 c++14 的支持存在问题。
 
 GCC7中over-aligned的问题暂时被禁止。
 

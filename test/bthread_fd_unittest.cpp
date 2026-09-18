@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <pthread.h>
+#include <memory>
 #include "gperftools_helper.h"
 #include "butil/time.h"
 #include "butil/macros.h"
@@ -91,13 +92,13 @@ void* process_thread(void* arg) {
     ssize_t n = read(m->fd, &count, sizeof(count));
     if (n != sizeof(count)) {
         LOG(FATAL) << "Should not happen in this test";
-        return NULL;
+        return nullptr;
     }
     count += NCLIENT;
     //printf("write result=%lu to fd=%d\n", count, m->fd);
     if (write(m->fd, &count, sizeof(count)) != sizeof(count)) {
         LOG(FATAL) << "Should not happen in this test";
-        return NULL;
+        return nullptr;
     }
 #ifdef CREATE_THREAD_TO_PROCESS
 # if defined(OS_LINUX)
@@ -109,10 +110,10 @@ void* process_thread(void* arg) {
     struct kevent kqueue_event;
     EV_SET(&kqueue_event, m->fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_ONESHOT,
             0, 0, m);
-    kevent(m->epfd, &kqueue_event, 1, NULL, 0, NULL);
+    kevent(m->epfd, &kqueue_event, 1, nullptr, 0, nullptr);
 # endif
 #endif
-    return NULL;
+    return nullptr;
 }
 
 void* epoll_thread(void* arg) {
@@ -147,7 +148,7 @@ void* epoll_thread(void* arg) {
         }
 # endif
 #elif defined(OS_MACOSX)
-        const int n = kevent(epfd, NULL, 0, e, ARRAY_SIZE(e), NULL);
+        const int n = kevent(epfd, nullptr, 0, e, ARRAY_SIZE(e), nullptr);
         if (stop) {
             break;
         }
@@ -189,7 +190,7 @@ void* epoll_thread(void* arg) {
         }
 #endif        
     }
-    return NULL;
+    return nullptr;
 }
 
 void* client_thread(void* arg) {
@@ -197,7 +198,7 @@ void* client_thread(void* arg) {
     for (size_t i = 0; i < m->times; ++i) {
         if (write(m->fd, &m->count, sizeof(m->count)) != sizeof(m->count)) {
             LOG(FATAL) << "Should not happen in this test";
-            return NULL;
+            return nullptr;
         }
 #ifdef RUN_CLIENT_IN_BTHREAD
         ssize_t rc;
@@ -215,10 +216,10 @@ void* client_thread(void* arg) {
 #endif
         if (rc != sizeof(m->count)) {
             PLOG(FATAL) << "Should not happen in this test, rc=" << rc;
-            return NULL;
+            return nullptr;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 inline uint32_t fmix32 ( uint32_t h ) {
@@ -252,7 +253,9 @@ TEST(FDTest, ping_pong) {
 #else
     pthread_t cth[NCLIENT];
 #endif
-    ClientMeta* cm[NCLIENT];
+    std::unique_ptr<ClientMeta> cm[NCLIENT];
+    std::unique_ptr<SocketMeta> sm[NCLIENT];
+    std::unique_ptr<EpollMeta> em_arr[NEPOLL];
 
     for (size_t i = 0; i < NEPOLL; ++i) {
 #if defined(OS_LINUX)
@@ -266,7 +269,8 @@ TEST(FDTest, ping_pong) {
     for (size_t i = 0; i < NCLIENT; ++i) {
         ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2 * i));
         //printf("Created fd=%d,%d i=%lu\n", fds[2*i], fds[2*i+1], i);
-        SocketMeta* m = new SocketMeta;
+        sm[i].reset(new SocketMeta);
+        SocketMeta* m = sm[i].get();
         m->fd = fds[i * 2];
         m->epfd = epfd[fmix32(i) % NEPOLL];
         ASSERT_EQ(0, fcntl(m->fd, F_SETFL, fcntl(m->fd, F_GETFL, 0) | O_NONBLOCK));
@@ -291,17 +295,17 @@ TEST(FDTest, ping_pong) {
 #if defined(OS_LINUX)
         ASSERT_EQ(0, epoll_ctl(m->epfd, EPOLL_CTL_ADD, m->fd, &evt));
 #elif defined(OS_MACOSX)
-        ASSERT_EQ(0, kevent(m->epfd, &kqueue_event, 1, NULL, 0, NULL));
+        ASSERT_EQ(0, kevent(m->epfd, &kqueue_event, 1, nullptr, 0, nullptr));
 #endif
-        cm[i] = new ClientMeta;
+        cm[i].reset(new ClientMeta);
         cm[i]->fd = fds[i * 2 + 1];
         cm[i]->count = i;
         cm[i]->times = REP;
 #ifdef RUN_CLIENT_IN_BTHREAD
         butil::make_non_blocking(cm[i]->fd);
-        ASSERT_EQ(0, bthread_start_urgent(&cth[i], NULL, client_thread, cm[i]));
+        ASSERT_EQ(0, bthread_start_urgent(&cth[i], nullptr, client_thread, cm[i].get()));
 #else
-        ASSERT_EQ(0, pthread_create(&cth[i], NULL, client_thread, cm[i]));
+        ASSERT_EQ(0, pthread_create(&cth[i], nullptr, client_thread, cm[i].get()));
 #endif
     }
 
@@ -310,20 +314,21 @@ TEST(FDTest, ping_pong) {
     tm.start();
 
     for (size_t i = 0; i < NEPOLL; ++i) {
-        EpollMeta *em = new EpollMeta;
+        em_arr[i].reset(new EpollMeta);
+        EpollMeta* em = em_arr[i].get();
         em->epfd = epfd[i];
 #ifdef RUN_EPOLL_IN_BTHREAD
-        ASSERT_EQ(0, bthread_start_urgent(&eth[i], epoll_thread, em, NULL);
+        ASSERT_EQ(0, bthread_start_urgent(&eth[i], epoll_thread, em, nullptr);
 #else
-        ASSERT_EQ(0, pthread_create(&eth[i], NULL, epoll_thread, em));
+        ASSERT_EQ(0, pthread_create(&eth[i], nullptr, epoll_thread, em));
 #endif
     }
 
     for (size_t i = 0; i < NCLIENT; ++i) {
 #ifdef RUN_CLIENT_IN_BTHREAD
-        bthread_join(cth[i], NULL);
+        bthread_join(cth[i], nullptr);
 #else
-        pthread_join(cth[i], NULL);
+        pthread_join(cth[i], nullptr);
 #endif
         ASSERT_EQ(i + REP * NCLIENT, cm[i]->count);
     }
@@ -333,17 +338,17 @@ TEST(FDTest, ping_pong) {
     stop = true;
     for (size_t i = 0; i < NEPOLL; ++i) {
 #if defined(OS_LINUX)
-        epoll_event evt = { EPOLLOUT,  { NULL } };
+        epoll_event evt = { EPOLLOUT,  { nullptr } };
         ASSERT_EQ(0, epoll_ctl(epfd[i], EPOLL_CTL_ADD, 0, &evt));
 #elif defined(OS_MACOSX)
         struct kevent kqueue_event;
-        EV_SET(&kqueue_event, 0, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
-        ASSERT_EQ(0, kevent(epfd[i], &kqueue_event, 1, NULL, 0, NULL));
+        EV_SET(&kqueue_event, 0, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+        ASSERT_EQ(0, kevent(epfd[i], &kqueue_event, 1, nullptr, 0, nullptr));
 #endif
 #ifdef RUN_EPOLL_IN_BTHREAD
-        bthread_join(eth[i], NULL);
+        bthread_join(eth[i], nullptr);
 #else
-        pthread_join(eth[i], NULL);
+        pthread_join(eth[i], nullptr);
 #endif
     }
     //bthread::stop_and_join_epoll_threads();
@@ -366,7 +371,7 @@ TEST(FDTest, mod_closed_fd) {
     int new_fd[2];
     int fd[2];
     ASSERT_EQ(0, pipe(fd));
-    epoll_event e = { EPOLLIN, { NULL } };
+    epoll_event e = { EPOLLIN, { nullptr } };
     errno = 0;
     ASSERT_EQ(-1, epoll_ctl(epfd, EPOLL_CTL_MOD, fd[0], &e));
     ASSERT_EQ(ENOENT, errno);
@@ -397,7 +402,7 @@ TEST(FDTest, mod_closed_fd) {
 TEST(FDTest, add_existing_fd) {
 #if defined(OS_LINUX)
     const int epfd = epoll_create(1024);
-    epoll_event e = { EPOLLIN, { NULL } };
+    epoll_event e = { EPOLLIN, { nullptr } };
     ASSERT_EQ(0, epoll_ctl(epfd, EPOLL_CTL_ADD, 0, &e));
     errno = 0;
     ASSERT_EQ(-1, epoll_ctl(epfd, EPOLL_CTL_ADD, 0, &e));
@@ -414,12 +419,12 @@ void* epoll_waiter(void* arg) {
     }
 #elif defined(OS_MACOSX)
     struct kevent e;
-    if (1 == kevent((int)(intptr_t)arg, NULL, 0, &e, 1, NULL)) {
+    if (1 == kevent((int)(intptr_t)arg, nullptr, 0, &e, 1, nullptr)) {
         std::cout << e.flags << std::endl;
     }
 #endif
     std::cout << pthread_self() << " quits" << std::endl;
-    return NULL;
+    return nullptr;
 }
 
 TEST(FDTest, interrupt_pthread) {
@@ -429,22 +434,22 @@ TEST(FDTest, interrupt_pthread) {
     const int epfd = kqueue();
 #endif
     pthread_t th, th2;
-    ASSERT_EQ(0, pthread_create(&th, NULL, epoll_waiter, (void*)(intptr_t)epfd));
-    ASSERT_EQ(0, pthread_create(&th2, NULL, epoll_waiter, (void*)(intptr_t)epfd));
+    ASSERT_EQ(0, pthread_create(&th, nullptr, epoll_waiter, (void*)(intptr_t)epfd));
+    ASSERT_EQ(0, pthread_create(&th2, nullptr, epoll_waiter, (void*)(intptr_t)epfd));
     bthread_usleep(100000L);
     std::cout << "wake up " << th << std::endl;
     bthread::interrupt_pthread(th);
     bthread_usleep(100000L);
     std::cout << "wake up " << th2 << std::endl;
     bthread::interrupt_pthread(th2);
-    pthread_join(th, NULL);
-    pthread_join(th2, NULL);
+    pthread_join(th, nullptr);
+    pthread_join(th2, nullptr);
 }
 
 void* close_the_fd(void* arg) {
     bthread_usleep(10000/*10ms*/);
     EXPECT_EQ(0, bthread_close(*(int*)arg));
-    return NULL;
+    return nullptr;
 }
 
 TEST(FDTest, invalid_epoll_events) {
@@ -457,9 +462,9 @@ TEST(FDTest, invalid_epoll_events) {
     ASSERT_EQ(EINVAL, errno);
     errno = 0;
 #if defined(OS_LINUX)
-    ASSERT_EQ(-1, bthread_fd_timedwait(-1, EPOLLIN, NULL));
+    ASSERT_EQ(-1, bthread_fd_timedwait(-1, EPOLLIN, nullptr));
 #elif defined(OS_MACOSX)
-    ASSERT_EQ(-1, bthread_fd_timedwait(-1, EVFILT_READ, NULL));
+    ASSERT_EQ(-1, bthread_fd_timedwait(-1, EVFILT_READ, nullptr));
 #endif
     ASSERT_EQ(EINVAL, errno);
 
@@ -470,7 +475,7 @@ TEST(FDTest, invalid_epoll_events) {
     ASSERT_EQ(EINVAL, errno);
 #endif
     bthread_t th;
-    ASSERT_EQ(0, bthread_start_urgent(&th, NULL, close_the_fd, &fds[1]));
+    ASSERT_EQ(0, bthread_start_urgent(&th, nullptr, close_the_fd, &fds[1]));
     butil::Timer tm;
     tm.start();
 #if defined(OS_LINUX)
@@ -480,7 +485,7 @@ TEST(FDTest, invalid_epoll_events) {
 #endif
     tm.stop();
     ASSERT_LT(tm.m_elapsed(), 20);
-    ASSERT_EQ(0, bthread_join(th, NULL));
+    ASSERT_EQ(0, bthread_join(th, nullptr));
     ASSERT_EQ(0, bthread_close(fds[0]));
 }
 
@@ -491,20 +496,20 @@ void* wait_for_the_fd(void* arg) {
 #elif defined(OS_MACOSX)
     bthread_fd_timedwait(*(int*)arg, EVFILT_READ, &ts);
 #endif
-    return NULL;
+    return nullptr;
 }
 
 TEST(FDTest, timeout) {
     int fds[2];
     ASSERT_EQ(0, pipe(fds));
     pthread_t th;
-    ASSERT_EQ(0, pthread_create(&th, NULL, wait_for_the_fd, &fds[0]));
+    ASSERT_EQ(0, pthread_create(&th, nullptr, wait_for_the_fd, &fds[0]));
     bthread_t bth;
-    ASSERT_EQ(0, bthread_start_urgent(&bth, NULL, wait_for_the_fd, &fds[0]));
+    ASSERT_EQ(0, bthread_start_urgent(&bth, nullptr, wait_for_the_fd, &fds[0]));
     butil::Timer tm;
     tm.start();
-    ASSERT_EQ(0, pthread_join(th, NULL));
-    ASSERT_EQ(0, bthread_join(bth, NULL));
+    ASSERT_EQ(0, pthread_join(th, nullptr));
+    ASSERT_EQ(0, bthread_join(bth, nullptr));
     tm.stop();
     ASSERT_LT(tm.m_elapsed(), 80);
     ASSERT_EQ(0, bthread_close(fds[0]));
@@ -515,19 +520,19 @@ TEST(FDTest, close_should_wakeup_waiter) {
     int fds[2];
     ASSERT_EQ(0, pipe(fds));
     bthread_t bth;
-    ASSERT_EQ(0, bthread_start_urgent(&bth, NULL, wait_for_the_fd, &fds[0]));
+    ASSERT_EQ(0, bthread_start_urgent(&bth, nullptr, wait_for_the_fd, &fds[0]));
     butil::Timer tm;
     tm.start();
     ASSERT_EQ(0, bthread_close(fds[0]));
-    ASSERT_EQ(0, bthread_join(bth, NULL));
+    ASSERT_EQ(0, bthread_join(bth, nullptr));
     tm.stop();
     ASSERT_LT(tm.m_elapsed(), 5);
 
     // Launch again, should quit soon due to EBADF
 #if defined(OS_LINUX)
-    ASSERT_EQ(-1, bthread_fd_timedwait(fds[0], EPOLLIN, NULL));
+    ASSERT_EQ(-1, bthread_fd_timedwait(fds[0], EPOLLIN, nullptr));
 #elif defined(OS_MACOSX)
-    ASSERT_EQ(-1, bthread_fd_timedwait(fds[0], EVFILT_READ, NULL));
+    ASSERT_EQ(-1, bthread_fd_timedwait(fds[0], EVFILT_READ, nullptr));
 #endif
     ASSERT_EQ(EBADF, errno);
 
@@ -612,7 +617,7 @@ void TestConnectInterruptImpl(bool timed) {
     int rc;
     if (timed) {
         int64_t start_ms = butil::cpuwide_time_ms();
-        butil::tcp_connect(ep, NULL);
+        butil::tcp_connect(ep, nullptr);
         int64_t connect_ms = butil::cpuwide_time_ms() - start_ms;
         LOG(INFO) << "Connect to " << ep << ", cost " << connect_ms << "ms";
 
@@ -623,7 +628,7 @@ void TestConnectInterruptImpl(bool timed) {
     } else {
         rc = bthread_timed_connect(
             sockfd, (struct sockaddr*) &serv_addr,
-            serv_addr_size, NULL);
+            serv_addr_size, nullptr);
     }
     ASSERT_EQ(0, rc) << "errno=" << errno;
     ASSERT_EQ(0, butil::is_connected(sockfd));
@@ -633,14 +638,14 @@ void TestConnectInterruptImpl(bool timed) {
 void* ConnectThread(void* arg) {
     bool timed = *(bool*)arg;
     TestConnectInterruptImpl(timed);
-    return NULL;
+    return nullptr;
 }
 
 void TestConnectInterrupt(bool timed) {
     bthread_t tid;
-    ASSERT_EQ(0, bthread_start_background(&tid, NULL, ConnectThread, &timed));
+    ASSERT_EQ(0, bthread_start_background(&tid, nullptr, ConnectThread, &timed));
     ASSERT_EQ(0, bthread_stop(tid));
-    ASSERT_EQ(0, bthread_join(tid, NULL));
+    ASSERT_EQ(0, bthread_join(tid, nullptr));
 }
 
 TEST(FDTest, interrupt) {

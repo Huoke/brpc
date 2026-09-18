@@ -20,7 +20,10 @@
 #include <google/protobuf/message.h>             // Message
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/io/coded_stream.h>
+
+#include "butil/strings/string_util.h"
 #include "butil/time.h"
+
 #include "brpc/controller.h"                     // Controller
 #include "brpc/socket.h"                         // Socket
 #include "brpc/server.h"                         // Server
@@ -227,7 +230,7 @@ static void SendHuluResponse(int64_t correlation_id,
                              MethodStatus* method_status,
                              int64_t received_us) {
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
+    auto span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
@@ -244,11 +247,11 @@ static void SendHuluResponse(int64_t correlation_id,
     
     bool append_body = false;
     butil::IOBuf res_body_buf;
-    // `res' can be NULL here, in which case we don't serialize it
+    // `res' can be nullptr here, in which case we don't serialize it
     // If user calls `SetFailed' on Controller, we don't serialize
     // response either
     CompressType type = cntl->response_compress_type();
-    if (res != NULL && !cntl->Failed()) {
+    if (res != nullptr && !cntl->Failed()) {
         if (!res->IsInitialized()) {
             cntl->SetFailed(
                 ERESPONSE, "Missing required fields in response: %s",
@@ -370,11 +373,7 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
         sample->submit(start_parse_us);
     }
 
-    std::unique_ptr<HuluController> cntl(new (std::nothrow) HuluController());
-    if (NULL == cntl.get()) {
-        LOG(WARNING) << "Fail to new Controller";
-        return;
-    }
+    std::unique_ptr<HuluController> cntl(new HuluController());
     std::unique_ptr<google::protobuf::Message> req;
     std::unique_ptr<google::protobuf::Message> res;
 
@@ -411,7 +410,7 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
         bthread_assign_data((void*)&server->thread_local_options());
     }
 
-    Span* span = NULL;
+    std::shared_ptr<Span> span;
     if (IsTraceable(meta.has_trace_id())) {
         span = Span::CreateServerSpan(
             meta.trace_id(), meta.span_id(), meta.parent_span_id(),
@@ -425,7 +424,7 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
         span->set_request_size(msg->payload.size() + msg->meta.size() + 12);
     }
 
-    MethodStatus* method_status = NULL;
+    MethodStatus* method_status = nullptr;
     do {
         if (!server->IsRunning()) {
             cntl->SetFailed(ELOGOFF, "Server is stopping");
@@ -443,24 +442,28 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
             break;
         }
         
-        const Server::MethodProperty *sp =
+        const Server::MethodProperty* mp =
             server_accessor.FindMethodPropertyByNameAndIndex(
                 meta.service_name(), meta.method_index());
-        if (NULL == sp) {
+        if (nullptr == mp) {
             cntl->SetFailed(ENOMETHOD, "Fail to find method=%d of service=%s",
                             meta.method_index(), meta.service_name().c_str());
             break;
-        } else if (sp->service->GetDescriptor()
-                   == BadMethodService::descriptor()) {
+        }
+        if (RejectBuiltinAccess(cntl.get(), *server, mp) ||
+            RejectNonBuiltinAccessFromInternalPort(cntl.get(), *server, mp)) {
+            break;
+        }
+        if (mp->service->GetDescriptor() == BadMethodService::descriptor()) {
             BadMethodRequest breq;
             BadMethodResponse bres;
             breq.set_service_name(meta.service_name());
-            sp->service->CallMethod(sp->method, cntl.get(), &breq, &bres, NULL);
+            mp->service->CallMethod(mp->method, cntl.get(), &breq, &bres, nullptr);
             break;
         }
         if (socket->is_overcrowded() &&
             !server->options().ignore_eovercrowded &&
-            !sp->ignore_eovercrowded) {
+            !mp->ignore_eovercrowded) {
             cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
                             butil::endpoint2str(socket->remote_side()).c_str());
             break;
@@ -468,18 +471,19 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
 
         // Switch to service-specific error.
         non_service_error.release();
-        method_status = sp->status;
+        method_status = mp->status;
+        const google::protobuf::MethodDescriptor* method = mp->method;
+        const std::string method_full_name = butil::EnsureString(method->full_name());
         if (method_status) {
             int rejected_cc = 0;
             if (!method_status->OnRequested(&rejected_cc)) {
                 cntl->SetFailed(ELIMIT, "Rejected by %s's ConcurrencyLimiter, concurrency=%d",
-                                sp->method->full_name().c_str(), rejected_cc);
+                                method_full_name.c_str(), rejected_cc);
                 break;
             }
         }
         
-        google::protobuf::Service* svc = sp->service;
-        const google::protobuf::MethodDescriptor* method = sp->method;
+        google::protobuf::Service* svc = mp->service;
         accessor.set_method(method);
 
         if (!server->AcceptRequest(cntl.get())) {
@@ -487,7 +491,7 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
         }
 
         if (span) {
-            span->ResetServerSpanName(method->full_name());
+            span->ResetServerSpanName(method_full_name);
         }
         const int reqsize = msg->payload.length();
         butil::IOBuf req_buf;
@@ -558,7 +562,7 @@ bool VerifyHuluRequest(const InputMessageBase* msg_base) {
         return false;
     }
     const Authenticator* auth = server->options().auth;
-    if (NULL == auth) {
+    if (nullptr == auth) {
         // Fast pass (no authentication)
         return true;
     }
@@ -599,7 +603,7 @@ void ProcessHuluResponse(InputMessageBase* msg_base) {
     }
 
     const bthread_id_t cid = { static_cast<uint64_t>(meta.correlation_id()) };
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -608,8 +612,7 @@ void ProcessHuluResponse(InputMessageBase* msg_base) {
     }
     
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.size() + msg->payload.size() + 12);
@@ -667,7 +670,7 @@ void PackHuluRequest(butil::IOBuf* req_buf,
                      const butil::IOBuf& req_body,
                      const Authenticator* auth) {
     HuluRpcRequestMeta meta;
-    if (auth != NULL && auth->GenerateCredential(
+    if (auth != nullptr && auth->GenerateCredential(
                 meta.mutable_credential_data()) != 0) {
         return cntl->SetFailed(EREQUEST, "Fail to generate credential");
     }
@@ -688,7 +691,7 @@ void PackHuluRequest(butil::IOBuf* req_buf,
     }
 
     HuluController* hulu_controller = dynamic_cast<HuluController*>(cntl);
-    if (hulu_controller != NULL) {
+    if (hulu_controller != nullptr) {
         if (hulu_controller->request_source_addr() != 0) {
             meta.set_user_defined_source_addr(
                     hulu_controller->request_source_addr());
@@ -711,7 +714,7 @@ void PackHuluRequest(butil::IOBuf* req_buf,
     } // else don't set user_mesage_size when there's no attachment, otherwise
     // existing hulu-pbrpc server may complain about empty attachment.
 
-    Span* span = ControllerPrivateAccessor(cntl).span();
+    auto span = ControllerPrivateAccessor(cntl).span();
     if (span) {
         meta.set_trace_id(span->trace_id());
         meta.set_span_id(span->span_id());

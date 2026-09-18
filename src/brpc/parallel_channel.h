@@ -46,7 +46,7 @@ struct SubCall {
         , flags(flags2)
     { }
 
-    SubCall() : method(NULL), request(NULL), response(NULL), flags(0) { }
+    SubCall() : method(nullptr), request(nullptr), response(nullptr), flags(0) { }
 
     // Returning this makes the call to ParallelChannel fail immediately.
     static SubCall Bad() { return SubCall(); }
@@ -60,7 +60,7 @@ struct SubCall {
 
     // True if this object is constructed by Bad().
     bool is_bad() const {
-        return request == NULL || response == NULL;
+        return request == nullptr || response == nullptr;
     }
 
     // True if this object is constructed by Skip().
@@ -91,6 +91,14 @@ struct SubCall {
 //   }
 //   return SubCall(sub_method, request->sub_request(channel_index),
 //                  response->add_sub_response(), 0);
+// MapController calls to ParallelChannel to sub channels, which can have
+// different controllers.
+// Note:
+// Modifying ClientSettings configurations (such as timeout, retries, etc.)
+// is ineffective because all sub-controllers use the main controller's
+// ClientSettings configuration.
+// Examples:
+// sub_cntl->http_request().SetHeader(...);
 class CallMapper : public SharedObject {
 public:
     virtual SubCall Map(int channel_index/*starting from 0*/,
@@ -98,7 +106,13 @@ public:
                         const google::protobuf::MethodDescriptor* method,
                         const google::protobuf::Message* request,
                         google::protobuf::Message* response) {
-        return Map(channel_index, method, request, response);    
+        return Map(channel_index, method, request, response);
+    }
+
+    virtual void MapController(int channel_index/*starting from 0*/, int channel_count,
+                               const Controller* main_cntl, Controller* sub_cntl) {
+        // Forward the attachment to each sub call by default.
+        sub_cntl->request_attachment().append(main_cntl->request_attachment());
     }
 
 protected:
@@ -199,11 +213,11 @@ public:
     // is OWNS_CHANNEL.
     // A sub channel can be added multiple times. If it's added with
     // brpc::OWNS_CHANNEL, it will be deleted for only once.
-    // If call_mapper is NULL:
+    // If call_mapper is nullptr:
     //  - Every sub_channel will get the same `request' to ParallelChannel
     //  - responses of sub channels are New()-ed from the `response' to
     //    ParallelChannel.
-    // If response_merger is NULL:
+    // If response_merger is nullptr:
     //  - responses of sub channels will be merged to the `response' to
     //    ParalleChannel by google::protobuf::Message::MergeFrom().
     // `call_mapper' and `response_merger' are always deleted in dtor.
@@ -229,7 +243,7 @@ public:
 
     // Call `method' of the remote service with `request' as input, and 
     // `response' as output. `controller' contains options and extra data.
-    // If `done' is not NULL, this method returns after request was sent
+    // If `done' is not nullptr, this method returns after request was sent
     // and `done->Run()' will be called when the call finishes, otherwise
     // caller blocks until the call finishes.
     void CallMethod(const google::protobuf::MethodDescriptor* method,

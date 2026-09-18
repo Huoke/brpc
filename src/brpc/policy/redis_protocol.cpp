@@ -64,7 +64,7 @@ int ConsumeCommand(RedisConnContext* ctx,
     if (ctx->transaction_handler) {
         result = ctx->transaction_handler->Run(ctx, args, &output, flush_batched);
         if (result == REDIS_CMD_HANDLED) {
-            ctx->transaction_handler.reset(NULL);
+            ctx->transaction_handler.reset(nullptr);
         } else if (result == REDIS_CMD_BATCHED) {
             LOG(ERROR) << "BATCHED should not be returned by a transaction handler.";
             return -1;
@@ -125,8 +125,16 @@ ParseResult ParseRedisMessage(butil::IOBuf* source, Socket* socket,
         if (!rs) {
             return MakeParseError(PARSE_ERROR_TRY_OTHERS);
         }
+        if (IsInternalPort(*server, socket->local_side())) {
+            // ServerOptions.internal_port serves builtin and Tabbed services
+            // only and a RedisService is neither. The command handlers run
+            // right here rather than in ProcessRedisRequest(), there is no
+            // Controller to reject the request with, so behave as if redis
+            // was not enabled on this port at all.
+            return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+        }
         RedisConnContext* ctx = static_cast<RedisConnContext*>(socket->parsing_context());
-        if (ctx == NULL) {
+        if (ctx == nullptr) {
             ctx = new RedisConnContext(rs);
             socket->reset_parsing_context(ctx);
         }
@@ -182,7 +190,7 @@ ParseResult ParseRedisMessage(butil::IOBuf* source, Socket* socket,
 
         do {
             InputResponse* msg = static_cast<InputResponse*>(socket->parsing_context());
-            if (msg == NULL) {
+            if (msg == nullptr) {
                 msg = new InputResponse;
                 socket->reset_parsing_context(msg);
             }
@@ -228,7 +236,7 @@ void ProcessRedisResponse(InputMessageBase* msg_base) {
     DestroyingPtr<InputResponse> msg(static_cast<InputResponse*>(msg_base));
 
     const bthread_id_t cid = msg->id_wait;
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -237,15 +245,14 @@ void ProcessRedisResponse(InputMessageBase* msg_base) {
     }
 
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->response.ByteSize());
         span->set_start_parse_us(start_parse_us);
     }
     const int saved_error = cntl->ErrorCode();
-    if (cntl->response() != NULL) {
+    if (cntl->response() != nullptr) {
         if (cntl->response()->GetDescriptor() != RedisResponse::descriptor()) {
             cntl->SetFailed(ERESPONSE, "Must be RedisResponse");
         } else {
@@ -274,7 +281,7 @@ void ProcessRedisRequest(InputMessageBase* msg_base) { }
 void SerializeRedisRequest(butil::IOBuf* buf,
                            Controller* cntl,
                            const google::protobuf::Message* request) {
-    if (request == NULL) {
+    if (request == nullptr) {
         return cntl->SetFailed(EREQUEST, "request is NULL");
     }
     if (request->GetDescriptor() != RedisRequest::descriptor()) {
@@ -283,7 +290,7 @@ void SerializeRedisRequest(butil::IOBuf* buf,
     const RedisRequest* rr = (const RedisRequest*)request;
     // If redis byte size is zero, brpc call will fail with E22. Continuous E22 may cause E112 in the end.
     // So set failed and return useful error message
-    if (rr->ByteSize() == 0) {
+    if (GetProtobufByteSize(*rr) == 0) {
         return cntl->SetFailed(EREQUEST, "request byte size is empty");
     }
     // We work around SerializeTo of pb which is just a placeholder.
@@ -311,7 +318,7 @@ void PackRedisRequest(butil::IOBuf* buf,
         buf->append(auth_str);
         const RedisAuthenticator* redis_auth =
             dynamic_cast<const RedisAuthenticator*>(auth);
-        if (redis_auth == NULL) {
+        if (redis_auth == nullptr) {
             return cntl->SetFailed(EREQUEST, "Fail to generate credential");
         }
         ControllerPrivateAccessor(cntl).set_auth_flags(

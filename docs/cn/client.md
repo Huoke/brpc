@@ -7,6 +7,7 @@ Echo的[client端代码](https://github.com/apache/brpc/blob/master/example/echo
 # 事实速查
 
 - Channel.Init()是线程不安全的。
+- 一个Channel只能成功初始化一次。Init()失败后可以重试。
 - Channel.CallMethod()是线程安全的，一个Channel可以被所有线程同时使用。
 - Channel可以分配在栈上。
 - Channel在发送异步请求后可以析构。
@@ -23,7 +24,7 @@ Channel可以**被所有线程共用**，你不需要为每个线程创建独立
 2. 共用资源。比如server和channel可以共用后台线程。(bthread的工作线程)
 3. 生命周期。析构ClientManager的过程很容易出错，现在由框架负责则不会有问题。
 
-就像大部分类那样，Channel必须在**Init**之后才能使用，options为NULL时所有参数取默认值，如果你要使用非默认值，这么做就行了：
+就像大部分类那样，Channel必须在**Init**之后才能使用，options为nullptr时所有参数取默认值，如果你要使用非默认值，这么做就行了：
 ```c++
 brpc::ChannelOptions options;  // 包含了默认值
 options.xxx = yyy;
@@ -32,12 +33,14 @@ channel.Init(..., &options);
 ```
 注意Channel不会修改options，Init结束后不会再访问options。所以options一般就像上面代码中那样放栈上。Channel.options()可以获得channel在使用的所有选项。
 
+Init失败后可以重试；一旦成功，Channel的目标和选项即固定，之后的所有Init调用都会返回-1。需要使用不同的目标或配置时，请新建一个Channel。
+
 Init函数分为连接一台服务器和连接服务集群。
 
 # 连接一台服务器
 
 ```c++
-// options为NULL时取默认值
+// options为nullptr时取默认值
 int Init(EndPoint server_addr_and_port, const ChannelOptions* options);
 int Init(const char* server_addr_and_port, const ChannelOptions* options);
 int Init(const char* server_addr, int port, const ChannelOptions* options);
@@ -68,7 +71,7 @@ int Init(const char* naming_service_url,
 
 你**不应该**在每次请求前动态地创建此类（连接服务集群的）Channel。因为创建和析构此类Channel牵涉到较多的资源，比如在创建时得访问一次命名服务，否则便不知道有哪些服务器可选。由于Channel可被多个线程共用，一般也没有必要动态创建。
 
-当`load_balancer_name`为NULL或空时，此Init等同于连接单台server的Init，`naming_service_url`应该是"ip:port"或"域名:port"。你可以通过这个Init函数统一Channel的初始化方式。比如你可以把`naming_service_url`和`load_balancer_name`放在配置文件中，要连接单台server时把`load_balancer_name`置空，要连接服务集群时则设置一个有效的算法名称。
+当`load_balancer_name`为nullptr或空时，此Init等同于连接单台server的Init，`naming_service_url`应该是"ip:port"或"域名:port"。你可以通过这个Init函数统一Channel的初始化方式。比如你可以把`naming_service_url`和`load_balancer_name`放在配置文件中，要连接单台server时把`load_balancer_name`置空，要连接服务集群时则设置一个有效的算法名称。
 
 ## 命名服务
 
@@ -208,7 +211,7 @@ struct ServerNode {
 ```
 常见的业务策略如根据server的tag进行过滤。
 
-自定义的过滤器配置在ChannelOptions中，默认为NULL（不过滤）。
+自定义的过滤器配置在ChannelOptions中，默认为nullptr（不过滤）。
 
 ```c++
 class MyNamingServiceFilter : public brpc::NamingServiceFilter {
@@ -260,6 +263,10 @@ int main() {
 
 locality-aware，优先选择延时低的下游，直到其延时高于其他机器，无需其他设置。实现原理请查看[Locality-aware load balancing](lalb.md)。
 
+### p2c
+
+即power-of-two-choices加peak-EWMA延时评分。每次选择随机采样两台服务器，把请求发给`延时 * (inflight + 1) / 权重`得分较低的那台。其中延时是对尖峰敏感的滑动平均：延时上升立即生效，恢复则按`tau_ms`（默认10秒）衰减。变慢或出错的服务器在一次观察内即被避开，且选择开销与集群规模无关，为O(1)。权重取自实例tag（同wrr，默认为1）。可选参数：`p2c:choices=4`（每次比较4台采样服务器，适合多台机器同时劣化的场景）、`p2c:tau_ms=5000`。
+
 ### c_murmurhash or c_md5
 
 一致性哈希，与简单hash的不同之处在于增加或删除机器时不会使分桶结果剧烈变化，特别适合cache类服务。
@@ -270,9 +277,15 @@ locality-aware，优先选择延时低的下游，直到其延时高于其他机
 
 注意甄别请求中的“主键”部分和“属性”部分，不要为了偷懒或通用，就把请求的所有内容一股脑儿计算出哈希值，属性的变化会使请求的目的地发生剧烈的变化。另外也要注意padding问题，比如struct Foo { int32_t a; int64_t b; }在64位机器上a和b之间有4个字节的空隙，内容未定义，如果像hash(&foo, sizeof(foo))这样计算哈希值，结果就是未定义的，得把内容紧密排列或序列化后再算。
 
+每台服务器的虚拟节点数默认由-chash_num_replicas控制（默认100），可按channel覆盖：`c_murmurhash:replicas=300`。
+
 实现原理请查看[Consistent Hashing](consistent_hashing.md)。
 
 其他lb不需要设置Controller.set_request_code()，如果调用了request_code也不会被lb使用，例如：lb=rr调用了Controller.set_request_code()，即使所有RPC的request_code都相同，也依然是rr。
+
+### c_murmurhash_bl
+
+即带负载上限的一致性哈希（"Consistent Hashing with Bounded Loads"，Mirrokni等，CACM 2017）。哈希环与`c_murmurhash`完全相同，但每台服务器额外有容量上限`ceil(load_factor * 平均在途请求数)`。当哈希命中的服务器已达上限时，请求沿哈希环顺时针溢出到下一台有余量的服务器，因此热点key不再压垮单台服务器，且溢出请求总是落到环上固定的后继节点，对cache仍然友好。系数默认来自-chash_bounded_load_factor（默认1.25，必须大于1），可按channel覆盖：`c_murmurhash_bl:load_factor=1.5`。`replicas`参数与`c_murmurhash`相同。
 
 ### 从集群宕机后恢复时的客户端限流
 
@@ -304,7 +317,7 @@ stub.some_method(controller, request, response, done);
 ```c++
 XXX_Stub(&channel).some_method(controller, request, response, done);
 ```
-一个例外是http/h2 client。访问http服务和protobuf没什么关系，直接调用CallMethod即可，除了Controller和done均为NULL，详见[访问http/h2服务](http_client.md)。
+一个例外是http/h2 client。访问http服务和protobuf没什么关系，直接调用CallMethod即可，除了Controller和done均为nullptr，详见[访问http/h2服务](http_client.md)。
 
 ## 同步访问
 
@@ -319,7 +332,7 @@ XXX_Stub stub(&channel);
  
 request.set_foo(...);
 cntl.set_timeout_ms(...);
-stub.some_method(&cntl, &request, &response, NULL);
+stub.some_method(&cntl, &request, &response, nullptr);
 if (cntl->Failed()) {
     // RPC失败了. response里的值是未定义的，勿用。
 } else {
@@ -820,8 +833,9 @@ brpc支持[Streaming RPC](streaming_rpc.md)，这是一种应用层的连接，�
 | Name               | Value | Description                              | Defined At              |
 | ------------------ | ----- | ---------------------------------------- | ----------------------- |
 | defer_close_second | 0     | Defer close of connections for so many seconds even if the connection is not used by anyone. Close immediately for non-positive values | src/brpc/socket_map.cpp |
+| defer_close_respect_idle | false | 当 defer_close_second > 0 时，如果连接在最后一个引用释放时已经闲置超过 defer_close_second，则立刻关闭连接（默认关闭以保持兼容） | src/brpc/socket_map.cpp |
 
-设置后引用计数清0时连接并不会立刻被关闭，而是会等待这么多秒再关闭，如果在这段时间内又有channel引用了这个连接，它会恢复正常被使用的状态。不管channel创建析构有多频率，这个选项使得关闭连接的频率有上限。这个选项的副作用是一些fd不会被及时关闭，如果延时被误设为一个大数值，程序占据的fd个数可能会很大。
+设置后引用计数清0时连接并不会立刻被关闭，而是会等待这么多秒再关闭，如果在这段时间内又有channel引用了这个连接，它会恢复正常被使用的状态。不管channel创建析构有多频率，这个选项使得关闭连接的频率有上限。这个选项的副作用是一些fd不会被及时关闭，如果延时被误设为一个大数值，程序占据的fd个数可能会很大。开启 -defer_close_respect_idle 后，如果连接在最后一个引用释放时已经闲置超过 defer_close_second，则可能会被关闭。
 
 ## 连接的缓冲区大小
 

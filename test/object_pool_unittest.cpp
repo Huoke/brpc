@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <memory>
 #include <gtest/gtest.h>
 #include "butil/time.h"
 #include "butil/macros.h"
@@ -184,9 +185,13 @@ TEST_F(ObjectPoolTest, get_int) {
     tm.stop();
     printf("get a int takes %.1fns\n", tm.n_elapsed()/(double)N);
     
+    std::vector<std::unique_ptr<int>> new_ints;
+    new_ints.reserve(N);
     tm.start();
     for (size_t i = 0; i < N; ++i) {
-        *(new int) = i;
+        int* pi = new int;
+        *pi = i;
+        new_ints.emplace_back(pi);
     }    
     tm.stop();
     printf("new a int takes %" PRId64 "ns\n", tm.n_elapsed()/N);
@@ -284,7 +289,7 @@ void* get_and_return_int(void*) {
                  (size_t)pthread_self(), j, tm1.n_elapsed()/(double)N,
                  tm2.n_elapsed()/(double)N);
     }
-    return NULL;
+    return nullptr;
 }
 
 void* new_and_delete_int(void*) {
@@ -321,29 +326,29 @@ void* new_and_delete_int(void*) {
                  tm2.n_elapsed()/(double)N);
     }
     
-    return NULL;
+    return nullptr;
 }
 
 TEST_F(ObjectPoolTest, get_and_return_int_single_thread) {
-    get_and_return_int(NULL);
-    new_and_delete_int(NULL);
+    get_and_return_int(nullptr);
+    new_and_delete_int(nullptr);
 }
 
 TEST_F(ObjectPoolTest, get_and_return_int_multiple_threads) {
     pthread_t tid[16];
     for (size_t i = 0; i < ARRAY_SIZE(tid); ++i) {
-        ASSERT_EQ(0, pthread_create(&tid[i], NULL, get_and_return_int, NULL));
+        ASSERT_EQ(0, pthread_create(&tid[i], nullptr, get_and_return_int, nullptr));
     }
     for (size_t i = 0; i < ARRAY_SIZE(tid); ++i) {
-        pthread_join(tid[i], NULL);
+        pthread_join(tid[i], nullptr);
     }
 
     pthread_t tid2[16];
     for (size_t i = 0; i < ARRAY_SIZE(tid2); ++i) {
-        ASSERT_EQ(0, pthread_create(&tid2[i], NULL, new_and_delete_int, NULL));
+        ASSERT_EQ(0, pthread_create(&tid2[i], nullptr, new_and_delete_int, nullptr));
     }
     for (size_t i = 0; i < ARRAY_SIZE(tid2); ++i) {
-        pthread_join(tid2[i], NULL);
+        pthread_join(tid2[i], nullptr);
     }
 
     std::cout << describe_objects<D>() << std::endl;

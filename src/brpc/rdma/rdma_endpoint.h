@@ -29,16 +29,37 @@
 #include "butil/iobuf.h"
 #include "butil/macros.h"
 #include "butil/containers/mpsc_queue.h"
+#include "butil/containers/optional.h"
 #include "brpc/socket.h"
+#include "brpc/rdma/rdma_handshake_server.h"
 
 
 namespace brpc {
 class Socket;
 namespace rdma {
 
+DECLARE_bool(rdma_use_polling);
 DECLARE_int32(rdma_poller_num);
-DECLARE_bool(rdma_edisp_unsched);
 DECLARE_bool(rdma_disable_bthread);
+
+class RdmaHandshakeClientV2;
+class RdmaHandshakeServerV2;
+class RdmaHandshakeClientV3;
+class RdmaHandshakeServerV3;
+struct ParsedHello;
+enum class RemoteHelloResult;
+class RdmaHello;
+class RdmaEndpoint;
+namespace v2_wire {
+    RemoteHelloResult ReadBodyAndNegotiate(RdmaEndpoint* ep, ParsedHello* remote);
+    int DrainBytes(RdmaEndpoint* ep, size_t n);
+}  // namespace v2_wire
+
+namespace v3_wire {
+    void FillLocalRdmaHello(const RdmaEndpoint* ep, RdmaHello* msg);
+    int  ReadAndParseV3Hello(RdmaEndpoint* ep, RdmaHello* out);
+    int  WriteV3Hello(RdmaEndpoint* ep, const RdmaHello& msg);
+}  // namespace v3_wire
 
 class RdmaConnect : public AppConnect {
 public:
@@ -53,26 +74,39 @@ public:
 
 private:
     void Run();
-    void (*_done)(int, void*);
-    void* _data;
+    void (*_done)(int, void*){nullptr};
+    void* _data{nullptr};
 };
 
 struct RdmaResource {
-    ibv_qp* qp;
-    ibv_cq* cq;
-    ibv_comp_channel* comp_channel;
-    RdmaResource* next;
-    RdmaResource();
+    RdmaResource* next{nullptr};
+    ibv_qp* qp{nullptr};
+    // For polling mode.
+    ibv_cq* polling_cq{nullptr};
+    // For event mode.
+    ibv_cq* send_cq{nullptr};
+    ibv_cq* recv_cq{nullptr};
+    ibv_comp_channel* comp_channel{nullptr};
+    RdmaResource() = default;
     ~RdmaResource();
     DISALLOW_COPY_AND_ASSIGN(RdmaResource);
 };
 
 class BAIDU_CACHELINE_ALIGNMENT RdmaEndpoint : public SocketUser {
 friend class RdmaConnect;
-friend class brpc::Socket;
+friend class Socket;
+friend class RdmaHandshakeClientV2;
+friend class RdmaHandshakeServerV2;
+friend class RdmaHandshakeClientV3;
+friend class RdmaHandshakeServerV3;
+friend RemoteHelloResult v2_wire::ReadBodyAndNegotiate(RdmaEndpoint*, ParsedHello*);
+friend int v2_wire::DrainBytes(RdmaEndpoint*, size_t);
+friend void v3_wire::FillLocalRdmaHello(const RdmaEndpoint*, RdmaHello*);
+friend int v3_wire::ReadAndParseV3Hello(RdmaEndpoint*, RdmaHello*);
+friend int v3_wire::WriteV3Hello(RdmaEndpoint*, const RdmaHello&);
 public:
-    RdmaEndpoint(Socket* s);
-    ~RdmaEndpoint();
+    explicit RdmaEndpoint(Socket* s);
+    ~RdmaEndpoint() override;
 
     // Global initialization
     // Return 0 if success, -1 if failed and errno set
@@ -91,10 +125,14 @@ public:
     bool IsWritable() const;
 
     // For debug
-    void DebugInfo(std::ostream& os) const;
+    void DebugInfo(std::ostream& os,
+                   butil::StringPiece connector = "\n") const;
 
-    // Callback when there is new epollin event on TCP fd
+    // Callback when there is new epollin event on TCP fd.
     static void OnNewDataFromTcp(Socket* m);
+
+    // Real handshake for RDMA-mode sockets.
+    static ParseResult ExecuteServerHandshake(butil::IOBuf* source, Socket* socket);
 
     // Initialize polling mode
     static int PollingModeInitialize(bthread_tag_t tag,
@@ -125,15 +163,44 @@ private:
     // Process handshake at the client
     static void* ProcessHandshakeAtClient(void* arg);
 
-    // Process handshake at the server
-    static void* ProcessHandshakeAtServer(void* arg);
+    static void OnNewDataFromTcpAtClient(Socket* m);
+    static void OnNewDataFromTcpAtServer(Socket* m);
 
-    // Allocate resources
+    bool HandleTcpEventAfterEstablished();
+
+    // Allocate resources. On failure the endpoint is left with no RDMA
+    // resource attached, so that the handshake can safely fall back to TCP.
     // Return 0 if success, -1 if failed and errno set
     int AllocateResources();
 
+    // The real implementation of AllocateResources(), which may return
+    // in the middle with resources partially allocated.
+    // Return 0 if success, -1 if failed and errno set
+    int DoAllocateResources();
+
     // Release resources
     void DeallocateResources();
+
+    // Create the Socket wrapping the CQ (and register it with the poller in
+    // polling mode), which is what makes CQ events reachable and thus starts
+    // PollCq.
+    //
+    // Must not be called before the handshake has reached ESTABLISHED, nor
+    // from within the fd stream's parsing path: PollCq() parses the input
+    // stream carried by the QP, and the Socket's `parsing_context` and
+    // `preferred_index` belong to the fd stream until the handshake is over
+    // and CutInputMessage has returned. It keeps writing both after the
+    // handshake handler hands the stream back. Those two are per-Socket,
+    // so letting PollCq in early makes two streams parse through one context.
+    // The server therefore calls this from OnNewDataFromTcpAtServer(), after
+    // OnNewMessages() returns, not from ExecuteServerHandshake().
+    //
+    // No CQE is lost by deferring: BringUpQp() fills the RQ before the QP
+    // reaches RTS, both CQs are armed by DoAllocateResources(), and adding an
+    // already readable fd to an edge-triggered epoll reports it immediately.
+    //
+    // Return 0 if success, -1 if failed and errno set
+    int StartCqEvents();
 
     // Send Imm data to the remote side
     // Arguments:
@@ -176,6 +243,7 @@ private:
     // wait for _read_butex if encounter EAGAIN
     // return -1 if encounter other errno (including EOF)
     int ReadFromFd(void* data, size_t len);
+    int ReadFromFd(butil::IOPortal* data, size_t len);
 
 
     // Write at most len bytes from data to fd in _socket
@@ -183,27 +251,37 @@ private:
     // return -1 if encounter other errno
     int WriteToFd(void* data, size_t len);
 
-    // Bringup the QP from RESET state to RTS state
+    // Write data to fd in _socket.
+    // wait for _epollout_butex if encounter EAGAIN.
+    // return -1 if encounter other errno.
+    int WriteToFd(butil::IOBuf* data);
+
+    // Copy negotiated remote parameters into the endpoint and compute
+    // the SQ/RQ window capacities. Called by both
+    // ProcessHandshakeAtClient and ProcessHandshakeAtServer after the
+    // peer's hello has been validated.
+    void ApplyRemoteHello(const ParsedHello& remote);
+
+    // Bringup the QP from RESET state to RTS state.
     // Arguments:
-    //     lid: remote LID
-    //     gid: remote GID
-    //     qp_num: remote QP number
-    // Return:
-    //     0:   success
-    //     -1:  failed, errno set
-    int BringUpQp(uint16_t lid, ibv_gid gid, uint32_t qp_num);
+    //   remote: parsed remote hello. Provides the remote LID/GID/QP
+    //           number for the RTR transition, and (on v3) the peer's
+    //           ECE to set during the INIT->RTR transition.
+    //   is_server: true on the server side, false on the client side.
+    // Returns 0 on success, -1 on failed and errno set.
+    int BringUpQp(const ParsedHello& remote, bool is_server);
 
     // Get event from comp channel and ack the events
-    int GetAndAckEvents();
+    int GetAndAckEvents(SocketUniquePtr& s);
+
+    // Request completion notification on a send/recv CQ.
+    int ReqNotifyCq(bool send_cq, bool fatal_on_error);
 
     // Poll CQ and get the work completion
     static void PollCq(Socket* m);
 
     // Get the description of current handshake state
     std::string GetStateStr() const;
-
-    // Try to read data on TCP fd in _socket
-    inline void TryReadOnTcp();
 
     // Add cq socket id to poller
     void PollerAddCqSid();
@@ -214,21 +292,42 @@ private:
     // Not owner
     Socket* _socket;
 
-    // State of Handshake
-    State _state;
+    // State of Handshake. FALLBACK_TCP publishes RdmaTransport::_rdma_state
+    // with release ordering and is consumed by OnNewDataFromTcpAtClient with acquire
+    // ordering. Other state accesses do not publish data and use relaxed
+    // ordering.
+    butil::atomic<State> _state;
+
+    // Wire-level handshake protocol version (set by dispatch in
+    // ProcessHandshakeAtClient/Server). Aligned with the protocol code:
+    //   0 = unnegotiated
+    //   2 = v2 "RDMA"
+    //   3 = v3 "RDM3"
+    int _handshake_version;
+
+    // ECE payload to advertise in the next local hello:
+    //   Client: the locally queried ECE capabilities (filled
+    //           before C_HELLO_SEND);
+    //   Server: the reduced/negotiated ECE queried after the
+    //           QP reached RTS (filled in BringUpQp).
+    butil::optional<ibv_ece> _outgoing_ece;
 
     // rdma resource
     RdmaResource* _resource;
 
-    // the number of events requiring ack
-    int _cq_events;
+    // The number of events requiring ack.
+    unsigned int _send_cq_events;
+    unsigned int _recv_cq_events;
 
-    // the SocketId which wrap the comp channel of CQ
+    // The SocketId which wrap the comp channel of CQ.
     SocketId _cq_sid;
 
     // Capacity of local Send Queue and local Recv Queue
     uint16_t _sq_size;
     uint16_t _rq_size;
+
+    // The input stream carried by the QP.
+    InputMessengerProcessor _input_processor;
 
     // Act as sendbuf and recvbuf, but requires no memcpy
     std::vector<butil::IOBuf> _sbuf;
@@ -256,8 +355,12 @@ private:
     uint16_t _local_window_capacity;
     // The capacity of remote window: min(local RQ, remote SQ)
     uint16_t _remote_window_capacity;
+    // The number of IMM WRs we can post to the local Send Queue.
+    uint16_t _sq_imm_window_size;
+    // The number of WRs we can send to remote side.
+    butil::atomic<uint16_t> _remote_rq_window_size;
     // The number of WRs we can post to the local Send Queue
-    butil::atomic<uint16_t> _window_size;
+    butil::atomic<uint16_t> _sq_window_size;
     // The number of new WRs posted in the local Recv Queue
     butil::atomic<uint16_t> _new_rq_wrs;
 
@@ -281,9 +384,9 @@ private:
         butil::MPSCQueue<CqSidOp, butil::ObjectPoolAllocator<CqSidOp>> op_queue;
         // Callback used for io_uring/spdk etc
         std::function<void()> callback;
-        // Init and Destory function
-        std::function<void(void)> init_fn;
-        std::function<void(void)> release_fn;
+        // Init and Destroy function
+        std::function<void()> init_fn;
+        std::function<void()> release_fn;
     };
     // Poller group
     struct BAIDU_CACHELINE_ALIGNMENT PollerGroup {

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.16...3.28)
 project(brpc C CXX)
 
 option(WITH_GLOG "With glog" OFF)
@@ -27,8 +27,17 @@ option(WITH_THRIFT "With thrift framed protocol supported" OFF)
 option(WITH_BTHREAD_TRACER "With bthread tracer supported" OFF)
 option(WITH_SNAPPY "With snappy" OFF)
 option(WITH_RDMA "With RDMA" OFF)
+option(WITH_URMA "With URMA (openEuler Unified Remote Memory Access)" OFF)
+set(URMA_USE_MOCK "AUTO" CACHE STRING
+    "URMA mock mode: AUTO, ON, or OFF (OFF requires liburma)")
+set_property(CACHE URMA_USE_MOCK PROPERTY STRINGS AUTO ON OFF)
+option(DOWNLOAD_URMA_HEADERS
+       "Download UMDK headers when WITH_URMA is enabled and headers are absent"
+       ON)
+option(WITH_UBRING "With UB" OFF)
 option(WITH_DEBUG_BTHREAD_SCHE_SAFETY "With debugging bthread sche safety" OFF)
 option(WITH_DEBUG_LOCK "With debugging lock" OFF)
+option(WITH_CPU_FREQUENCY "Use CPU frequency for cpuwide_time" OFF)
 option(WITH_ASAN "With AddressSanitizer" OFF)
 option(BUILD_UNIT_TESTS "Whether to build unit tests" OFF)
 option(BUILD_FUZZ_TESTS "Whether to build fuzz tests" OFF)
@@ -40,25 +49,33 @@ if(POLICY CMP0042)
     cmake_policy(SET CMP0042 NEW)
 endif()
 
-set(BRPC_VERSION 1.13.0)
+set(BRPC_VERSION 1.18.0)
 
 SET(CPACK_GENERATOR "DEB")
 SET(CPACK_DEBIAN_PACKAGE_MAINTAINER "brpc authors")
 INCLUDE(CPack)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # require at least gcc 4.8
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4.8)
-        message(FATAL_ERROR "GCC is too old, please install a newer version supporting C++11")
+    # require at least gcc 5.0
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 5.0)
+        message(FATAL_ERROR "GCC is too old, please install a newer version supporting C++14")
     endif()
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    # require at least clang 3.3
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 3.3)
-        message(FATAL_ERROR "Clang is too old, please install a newer version supporting C++11")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # require at least clang 3.5
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 3.5)
+        message(FATAL_ERROR "Clang is too old, please install a newer version supporting C++14")
     endif()
 else()
     message(WARNING "You are using an unsupported compiler! Compilation has only been tested with Clang and GCC.")
 endif()
+
+set(BRPC_COMMON_COMPILE_OPTIONS)
+set(BRPC_COMMON_DEFINITIONS)
+set(BRPC_COMMON_INCLUDE_DIRS
+    ${PROJECT_SOURCE_DIR}/src
+)
+set(BRPC_COMMON_LINK_OPTIONS)
+set(BRPC_CXX_STANDARD 14)
 
 set(WITH_GLOG_VAL "0")
 if(WITH_GLOG)
@@ -66,8 +83,14 @@ if(WITH_GLOG)
     set(BRPC_WITH_GLOG 1)
 endif()
 
+set(WITH_CPU_FREQUENCY_VAL "0")
+if(WITH_CPU_FREQUENCY)
+    set(WITH_CPU_FREQUENCY_VAL "1")
+    set(BUTIL_USE_CPU_FREQUENCY 1)
+endif()
+
 if(WITH_DEBUG_SYMBOLS)
-    set(DEBUG_SYMBOL "-g")
+    list(APPEND BRPC_COMMON_COMPILE_OPTIONS -g)
 endif()
 
 set(WITH_DEBUG_LOCK_VAL "0")
@@ -76,7 +99,7 @@ if(WITH_DEBUG_LOCK)
 endif()
 
 if(WITH_THRIFT)
-    set(THRIFT_CPP_FLAG "-DENABLE_THRIFT_FRAMED_PROTOCOL")
+    list(APPEND BRPC_COMMON_DEFINITIONS ENABLE_THRIFT_FRAMED_PROTOCOL)
     find_library(THRIFT_LIB NAMES thrift)
     if (NOT THRIFT_LIB)
         message(FATAL_ERROR "Fail to find Thrift")
@@ -93,13 +116,33 @@ if (WITH_BTHREAD_TRACER)
     if (NOT LIBUNWIND_INCLUDE_PATH OR NOT LIBUNWIND_LIB)
         message(FATAL_ERROR "Fail to find libunwind, which is needed by bthread tracer")
     endif()
-    add_definitions(-DBRPC_BTHREAD_TRACER)
-    include_directories(${LIBUNWIND_INCLUDE_PATH})
+    find_package(absl REQUIRED CONFIG)
+    set(bthread_tracer_ABSL_USED_TARGETS absl::base absl::stacktrace absl::symbolize)
+    list(APPEND BRPC_COMMON_DEFINITIONS BRPC_BTHREAD_TRACER)
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${LIBUNWIND_INCLUDE_PATH})
 endif ()
 
 set(WITH_RDMA_VAL "0")
 if(WITH_RDMA)
     set(WITH_RDMA_VAL "1")
+endif()
+
+set(WITH_URMA_VAL "0")
+if(WITH_URMA)
+    set(WITH_URMA_VAL "1")
+endif()
+
+string(TOUPPER "${URMA_USE_MOCK}" URMA_USE_MOCK_MODE)
+if(NOT URMA_USE_MOCK_MODE STREQUAL "AUTO" AND
+   NOT URMA_USE_MOCK_MODE STREQUAL "ON" AND
+   NOT URMA_USE_MOCK_MODE STREQUAL "OFF")
+    message(FATAL_ERROR
+        "URMA_USE_MOCK must be AUTO, ON, or OFF, got: ${URMA_USE_MOCK}")
+endif()
+
+set(WITH_UBRING_VAL "0")
+if(WITH_UBRING)
+        set(WITH_UBRING_VAL "1")
 endif()
 
 set(WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL "0")
@@ -115,69 +158,99 @@ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 find_package(GFLAGS REQUIRED)
 
-include_directories(
-    ${PROJECT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_BINARY_DIR}
-)
-
 execute_process(
     COMMAND bash -c "${PROJECT_SOURCE_DIR}/tools/get_brpc_revision.sh ${PROJECT_SOURCE_DIR} | tr -d '\n'"
     OUTPUT_VARIABLE BRPC_REVISION
 )
+string(REPLACE "\\|" "|" BRPC_REVISION "${BRPC_REVISION}")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     include(CheckFunctionExists)
     CHECK_FUNCTION_EXISTS(clock_gettime HAVE_CLOCK_GETTIME)
     if(NOT HAVE_CLOCK_GETTIME)
-        set(DEFINE_CLOCK_GETTIME "-DNO_CLOCK_GETTIME_IN_MAC")
+        list(APPEND BRPC_COMMON_DEFINITIONS NO_CLOCK_GETTIME_IN_MAC)
     endif()
-    set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -Wno-deprecated-declarations -Wno-inconsistent-missing-override")
+    list(APPEND BRPC_COMMON_COMPILE_OPTIONS
+        -Wno-deprecated-declarations
+        -Wno-inconsistent-missing-override
+    )
 endif()
 
-set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL} -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=${WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL} -DBRPC_DEBUG_LOCK=${WITH_DEBUG_LOCK_VAL}")
-if (WITH_ASAN)
-    set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -fsanitize=address")
-    set(CMAKE_C_FLAGS "${CMAKE_CPP_FLAGS} -fsanitize=address")
+list(APPEND BRPC_COMMON_DEFINITIONS
+    BRPC_WITH_GLOG=${WITH_GLOG_VAL}
+    BRPC_WITH_RDMA=${WITH_RDMA_VAL}
+    BRPC_WITH_URMA=${WITH_URMA_VAL}
+    BRPC_WITH_UBRING=${WITH_UBRING_VAL}
+    BRPC_DEBUG_BTHREAD_SCHE_SAFETY=${WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL}
+    BRPC_DEBUG_LOCK=${WITH_DEBUG_LOCK_VAL}
+    BUTIL_USE_CPU_FREQUENCY=${WITH_CPU_FREQUENCY_VAL}
+    BTHREAD_USE_FAST_PTHREAD_MUTEX
+    __const__=__unused__
+    _GNU_SOURCE
+    USE_SYMBOLIZE
+    NO_TCMALLOC
+    __STDC_FORMAT_MACROS
+    __STDC_LIMIT_MACROS
+    __STDC_CONSTANT_MACROS
+    __STRICT_ANSI__
+)
+
+if(NOT DEBUG)
+    list(APPEND BRPC_COMMON_DEFINITIONS NDEBUG)
+endif()
+if(WITH_ASAN)
+    list(APPEND BRPC_COMMON_COMPILE_OPTIONS -fsanitize=address)
+    list(APPEND BRPC_COMMON_LINK_OPTIONS -fsanitize=address)
 endif()
 if(WITH_MESALINK)
-    set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DUSE_MESALINK")
+    list(APPEND BRPC_COMMON_DEFINITIONS USE_MESALINK)
 endif()
-set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__=__unused__ -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DBRPC_REVISION=\\\"${BRPC_REVISION}\\\" -D__STRICT_ANSI__")
-set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEBUG_SYMBOL} ${THRIFT_CPP_FLAG}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer")
-set(CMAKE_C_FLAGS "${CMAKE_CPP_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-unused-parameter -fno-omit-frame-pointer")
 
-macro(use_cxx11)
-if(CMAKE_VERSION VERSION_LESS "3.1.3")
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
-    endif()
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
-    endif()
-else()
-    set(CMAKE_CXX_STANDARD 11)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-endif()
-endmacro(use_cxx11)
+list(APPEND BRPC_COMMON_COMPILE_OPTIONS
+    -O2
+    -pipe
+    -Wall
+    -W
+    -fPIC
+    -fstrict-aliasing
+    -Wno-unused-parameter
+    -fno-omit-frame-pointer
+    "-DBRPC_REVISION=\"${BRPC_REVISION}\""
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-invalid-offsetof>
+)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     #required by butil/crc32.cc to boost performance for 10x
     if((CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)") AND NOT (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4.4))
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4 -msse4.2")
+        list(APPEND BRPC_COMMON_COMPILE_OPTIONS
+            $<$<COMPILE_LANGUAGE:CXX>:-msse4>
+            $<$<COMPILE_LANGUAGE:CXX>:-msse4.2>
+        )
     elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64"))
         # segmentation fault in libcontext
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-gcse")
+        list(APPEND BRPC_COMMON_COMPILE_OPTIONS $<$<COMPILE_LANGUAGE:CXX>:-fno-gcse>)
+    elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64"))
+        # RISC-V specific optimizations
+        option(WITH_RISCV_ZBC "Enable RISC-V Zbc carry-less multiplication for CRC32C acceleration" OFF)
+        option(WITH_RISCV_ZVBC "Enable RISC-V Zvbc vector carry-less multiplication for CRC32C acceleration" OFF)
+        if(WITH_RISCV_ZVBC)
+            list(APPEND BRPC_COMMON_COMPILE_OPTIONS $<$<COMPILE_LANGUAGE:CXX>:-march=rv64gcv_zbc_zvbc>)
+        elseif(WITH_RISCV_ZBC)
+            list(APPEND BRPC_COMMON_COMPILE_OPTIONS $<$<COMPILE_LANGUAGE:CXX>:-march=rv64gc_zbc>)
+        else()
+            list(APPEND BRPC_COMMON_COMPILE_OPTIONS $<$<COMPILE_LANGUAGE:CXX>:-march=rv64gc>)
+        endif()
     endif()
     if(NOT (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0))
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-aligned-new")
+        list(APPEND BRPC_COMMON_COMPILE_OPTIONS $<$<COMPILE_LANGUAGE:CXX>:-Wno-aligned-new>)
     endif()
 endif()
 
 find_package(Protobuf REQUIRED)
-if(Protobuf_VERSION GREATER 4.21)
+find_package(ZLIB REQUIRED)
+if(Protobuf_VERSION VERSION_GREATER 4.21)
     # required by absl
-    set(CMAKE_CXX_STANDARD 17)
+    set(BRPC_CXX_STANDARD 17)
 
     find_package(absl REQUIRED CONFIG)
     set(protobuf_ABSL_USED_TARGETS
@@ -201,11 +274,13 @@ if(Protobuf_VERSION GREATER 4.21)
         absl::hash
         absl::layout
         absl::log_initialize
+        absl::log_globals
         absl::log_severity
         absl::memory
         absl::node_hash_map
         absl::node_hash_set
-        absl::optional
+        absl::random_distributions
+        absl::random_random
         absl::span
         absl::status
         absl::statusor
@@ -216,8 +291,6 @@ if(Protobuf_VERSION GREATER 4.21)
         absl::utility
         absl::variant
     )
-else()
-    use_cxx11()
 endif()
 find_package(Threads REQUIRED)
 
@@ -233,7 +306,7 @@ if(WITH_SNAPPY)
     if ((NOT SNAPPY_INCLUDE_PATH) OR (NOT SNAPPY_LIB))
         message(FATAL_ERROR "Fail to find snappy")
     endif()
-    include_directories(${SNAPPY_INCLUDE_PATH})
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${SNAPPY_INCLUDE_PATH})
 endif()
 
 if(WITH_GLOG)
@@ -242,7 +315,7 @@ if(WITH_GLOG)
     if((NOT GLOG_INCLUDE_PATH) OR (NOT GLOG_LIB))
         message(FATAL_ERROR "Fail to find glog")
     endif()
-    include_directories(${GLOG_INCLUDE_PATH})
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${GLOG_INCLUDE_PATH})
 endif()
 
 if(WITH_MESALINK)
@@ -253,7 +326,7 @@ if(WITH_MESALINK)
     else()
         message(STATUS "Found MesaLink: ${MESALINK_LIB}")
     endif()
-    include_directories(${MESALINK_INCLUDE_PATH})
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${MESALINK_INCLUDE_PATH})
 endif()
 
 if(WITH_RDMA)
@@ -262,6 +335,70 @@ if(WITH_RDMA)
     find_library(RDMA_LIB NAMES ibverbs)
     if((NOT RDMA_INCLUDE_PATH) OR (NOT RDMA_LIB))
         message(FATAL_ERROR "Fail to find ibverbs")
+    endif()
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${RDMA_INCLUDE_PATH})
+endif()
+
+if(WITH_URMA)
+    # UrmaTransport and its link-time mock both compile against the upstream
+    # UMDK API. Prefer installed headers; otherwise fetch a pinned upstream
+    # commit, following Mooncake's URMA mock setup.
+    find_path(URMA_INCLUDE_PATH NAMES urma_api.h
+              HINTS ENV URMA_ROOT
+              PATHS /usr/include /usr/local/include
+              PATH_SUFFIXES ub/umdk/urma umdk/urma urma
+                            src/urma/lib/urma/core/include)
+    find_path(URMA_BOND_INCLUDE_PATH NAMES urma_ubagg.h
+              HINTS ENV URMA_ROOT
+              PATHS /usr/include /usr/local/include
+              PATH_SUFFIXES ub/umdk/urma umdk/urma urma
+                            src/urma/lib/urma/bond/include)
+    if(NOT URMA_INCLUDE_PATH AND DOWNLOAD_URMA_HEADERS)
+        include(FetchContent)
+        FetchContent_Declare(
+            urma_headers
+            GIT_REPOSITORY https://atomgit.com/openeuler/umdk.git
+            GIT_TAG 564ee727a55523d4351a8fb3c94292b388ebb924
+            # brpc only consumes UMDK headers; avoid cloning unrelated UMDK
+            # submodules such as CAM dependencies during configuration.
+            GIT_SUBMODULES ""
+            GIT_SHALLOW TRUE)
+        FetchContent_GetProperties(urma_headers)
+        if(NOT urma_headers_POPULATED)
+            FetchContent_Populate(urma_headers)
+        endif()
+        set(URMA_INCLUDE_PATH
+            "${urma_headers_SOURCE_DIR}/src/urma/lib/urma/core/include")
+        set(URMA_BOND_INCLUDE_PATH
+            "${urma_headers_SOURCE_DIR}/src/urma/lib/urma/bond/include")
+        message(STATUS "Using downloaded UMDK headers: ${URMA_INCLUDE_PATH}")
+    endif()
+    if(NOT URMA_INCLUDE_PATH)
+        message(FATAL_ERROR
+            "Fail to find urma_api.h. Install UMDK headers, set URMA_ROOT, "
+            "or enable DOWNLOAD_URMA_HEADERS.")
+    endif()
+
+    find_library(URMA_LIB NAMES urma
+                 HINTS ENV URMA_ROOT
+                 PATH_SUFFIXES lib lib64)
+    if(URMA_USE_MOCK_MODE STREQUAL "ON")
+        message(STATUS "URMA_USE_MOCK=ON; forcing the link-time URMA mock")
+        set(URMA_USE_MOCK_ENABLED 1)
+    elseif(URMA_USE_MOCK_MODE STREQUAL "OFF")
+        if(NOT URMA_LIB)
+            message(FATAL_ERROR
+                "URMA_USE_MOCK=OFF requires liburma; install it or use AUTO/ON.")
+        endif()
+        message(STATUS "URMA_USE_MOCK=OFF; using liburma")
+        set(URMA_USE_MOCK_ENABLED 0)
+    elseif(URMA_LIB)
+        message(STATUS "Found URMA library: ${URMA_LIB}")
+        set(URMA_USE_MOCK_ENABLED 0)
+    else()
+        message(STATUS
+            "liburma not found; building with the URMA link-time mock")
+        set(URMA_USE_MOCK_ENABLED 1)
     endif()
 endif()
 
@@ -272,7 +409,7 @@ endif()
 
 if(WITH_BORINGSSL)
     find_package(BoringSSL)
-    include_directories(${BORINGSSL_INCLUDE_DIR})
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${BORINGSSL_INCLUDE_DIR})
 else()
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND NOT OPENSSL_ROOT_DIR)
         set(OPENSSL_ROOT_DIR
@@ -280,15 +417,21 @@ else()
         )
     endif()
 
-    find_package(OpenSSL)
-    include_directories(${OPENSSL_INCLUDE_DIR})
+    find_package(OpenSSL REQUIRED)
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
 endif()
 
-include_directories(
-        ${GFLAGS_INCLUDE_PATH}
-        ${PROTOBUF_INCLUDE_DIRS}
-        ${LEVELDB_INCLUDE_PATH}
-        )
+list(APPEND BRPC_COMMON_INCLUDE_DIRS
+    ${GFLAGS_INCLUDE_PATH}
+    ${PROTOBUF_INCLUDE_DIRS}
+    ${LEVELDB_INCLUDE_PATH}
+)
+if(WITH_URMA)
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${URMA_INCLUDE_PATH})
+    if(URMA_BOND_INCLUDE_PATH)
+        list(APPEND BRPC_COMMON_INCLUDE_DIRS ${URMA_BOND_INCLUDE_PATH})
+    endif()
+endif()
 
 set(DYNAMIC_LIB
     ${GFLAGS_LIBRARY}
@@ -298,22 +441,35 @@ set(DYNAMIC_LIB
     ${CMAKE_THREAD_LIBS_INIT}
     ${THRIFT_LIB}
     dl
-    z)
+    ZLIB::ZLIB)
 
 if(WITH_BORINGSSL)
     list(APPEND DYNAMIC_LIB ${BORINGSSL_SSL_LIBRARY})
     list(APPEND DYNAMIC_LIB ${BORINGSSL_CRYPTO_LIBRARY})
 else()
-    list(APPEND DYNAMIC_LIB ${OPENSSL_CRYPTO_LIBRARY})
     if(WITH_MESALINK)
+        list(APPEND DYNAMIC_LIB ${OPENSSL_CRYPTO_LIBRARY})
         list(APPEND DYNAMIC_LIB ${MESALINK_LIB})
     else()
         list(APPEND DYNAMIC_LIB ${OPENSSL_SSL_LIBRARY})
+        list(APPEND DYNAMIC_LIB ${OPENSSL_CRYPTO_LIBRARY})
     endif()
 endif()
 
 if(WITH_RDMA)
     list(APPEND DYNAMIC_LIB ${RDMA_LIB})
+endif()
+
+if(WITH_URMA)
+    message(STATUS "brpc compile with URMA (mock=${URMA_USE_MOCK_ENABLED})")
+    if(NOT URMA_USE_MOCK_ENABLED)
+        list(APPEND DYNAMIC_LIB ${URMA_LIB})
+    endif()
+endif()
+
+if(WITH_UBRING)
+    message(STATUS "brpc compile with ubring")
+    list(APPEND DYNAMIC_LIB ${UB_LIB})
 endif()
 
 set(BRPC_PRIVATE_LIBS "-lgflags -lprotobuf -lleveldb -lprotoc -lssl -lcrypto -ldl -lz")
@@ -329,8 +485,8 @@ if(WITH_SNAPPY)
 endif()
 
 if (WITH_BTHREAD_TRACER)
-    set(DYNAMIC_LIB ${DYNAMIC_LIB} ${LIBUNWIND_LIB} ${LIBUNWIND_X86_64_LIB})
-    set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -lunwind -lunwind-x86_64")
+    set(DYNAMIC_LIB ${DYNAMIC_LIB} ${LIBUNWIND_LIB} ${LIBUNWIND_X86_64_LIB} ${bthread_tracer_ABSL_USED_TARGETS})
+    set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -lunwind -lunwind-x86_64  -labsl_stacktrace -labsl_symbolize -labsl_debugging_internal -labsl_demangle_internal -labsl_malloc_internal -labsl_raw_logging_internal -labsl_spinlock_wait -labsl_base")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -354,6 +510,21 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     )
 endif()
 
+list(REMOVE_DUPLICATES BRPC_COMMON_INCLUDE_DIRS)
+
+add_library(brpc_common_config INTERFACE)
+# Generated protobuf headers live in the build directory. Search it before src/
+# so leftover in-source *.pb.h (gitignored, produced by Make) cannot shadow
+# updated .proto files such as errno.proto.
+target_include_directories(brpc_common_config BEFORE INTERFACE ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(brpc_common_config INTERFACE ${BRPC_COMMON_INCLUDE_DIRS})
+target_compile_definitions(brpc_common_config INTERFACE ${BRPC_COMMON_DEFINITIONS})
+target_compile_options(brpc_common_config INTERFACE ${BRPC_COMMON_COMPILE_OPTIONS})
+target_compile_features(brpc_common_config INTERFACE cxx_std_${BRPC_CXX_STANDARD})
+if(BRPC_COMMON_LINK_OPTIONS)
+    target_link_options(brpc_common_config INTERFACE ${BRPC_COMMON_LINK_OPTIONS})
+endif()
+
 # for *.so
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/output/lib)
 # for *.a
@@ -368,6 +539,7 @@ set(BUTIL_SOURCES
     ${PROJECT_SOURCE_DIR}/src/butil/third_party/icu/icu_utf.cc
     ${PROJECT_SOURCE_DIR}/src/butil/third_party/superfasthash/superfasthash.c
     ${PROJECT_SOURCE_DIR}/src/butil/third_party/modp_b64/modp_b64.cc
+    ${PROJECT_SOURCE_DIR}/src/butil/third_party/modp_b64/modp_b64_rvv.cc
     ${PROJECT_SOURCE_DIR}/src/butil/third_party/symbolize/demangle.cc
     ${PROJECT_SOURCE_DIR}/src/butil/third_party/symbolize/symbolize.cc
     ${PROJECT_SOURCE_DIR}/src/butil/third_party/snappy/snappy-sinksource.cc
@@ -428,6 +600,7 @@ set(BUTIL_SOURCES
     ${PROJECT_SOURCE_DIR}/src/butil/strings/string_number_conversions.cc
     ${PROJECT_SOURCE_DIR}/src/butil/strings/string_split.cc
     ${PROJECT_SOURCE_DIR}/src/butil/strings/string_piece.cc
+    ${PROJECT_SOURCE_DIR}/src/butil/string_compare_rvv.cc
     ${PROJECT_SOURCE_DIR}/src/butil/strings/string_util.cc
     ${PROJECT_SOURCE_DIR}/src/butil/strings/string_util_constants.cc
     ${PROJECT_SOURCE_DIR}/src/butil/strings/stringprintf.cc
@@ -473,6 +646,7 @@ set(BUTIL_SOURCES
     ${PROJECT_SOURCE_DIR}/src/butil/crc32c.cc
     ${PROJECT_SOURCE_DIR}/src/butil/containers/case_ignored_flat_map.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/iobuf.cpp
+    ${PROJECT_SOURCE_DIR}/src/butil/single_iobuf.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/iobuf_profiler.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/binary_printer.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/recordio.cc
@@ -495,12 +669,20 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         ${PROJECT_SOURCE_DIR}/src/butil/mac/scoped_mach_port.cc)
 endif()
 
-file(GLOB_RECURSE BVAR_SOURCES "${PROJECT_SOURCE_DIR}/src/bvar/*.cpp")
-file(GLOB_RECURSE BTHREAD_SOURCES "${PROJECT_SOURCE_DIR}/src/bthread/*.cpp")
-file(GLOB_RECURSE JSON2PB_SOURCES "${PROJECT_SOURCE_DIR}/src/json2pb/*.cpp")
-file(GLOB_RECURSE BRPC_SOURCES "${PROJECT_SOURCE_DIR}/src/brpc/*.cpp")
-file(GLOB_RECURSE THRIFT_SOURCES "${PROJECT_SOURCE_DIR}/src/brpc/thrift*.cpp")
-file(GLOB_RECURSE EXCLUDE_SOURCES "${PROJECT_SOURCE_DIR}/src/brpc/event_dispatcher_*.cpp")
+file(GLOB_RECURSE BVAR_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/bvar/*.cpp")
+file(GLOB_RECURSE BTHREAD_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/bthread/*.cpp")
+file(GLOB_RECURSE JSON2PB_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/json2pb/*.cpp")
+file(GLOB_RECURSE BRPC_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/*.cpp")
+file(GLOB_RECURSE THRIFT_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/thrift*.cpp")
+file(GLOB_RECURSE EXCLUDE_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/event_dispatcher_*.cpp")
+
+# When building with the real liburma, exclude the link-time mock so its urma_*
+# symbols do not clash with the library. When liburma is absent, keep it so CI
+# can build and test UrmaTransport without URMA hardware.
+if(WITH_URMA AND NOT URMA_USE_MOCK_ENABLED)
+    list(REMOVE_ITEM BRPC_SOURCES
+         "${PROJECT_SOURCE_DIR}/src/brpc/urma/mock_urma.cpp")
+endif()
 
 if(WITH_THRIFT)
     message("brpc compile with thrift protocol")
@@ -541,7 +723,9 @@ set(PROTO_FILES idl_options.proto
                 brpc/policy/mongo.proto
                 brpc/trackme.proto
                 brpc/streaming_rpc_meta.proto
-                brpc/proto_base.proto)
+                brpc/proto_base.proto
+                brpc/rdma/rdma_handshake.proto
+                brpc/urma/urma_handshake.proto)
 file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/output/include/brpc)
 set(PROTOC_FLAGS ${PROTOC_FLAGS} -I${PROTOBUF_INCLUDE_DIR})
 compile_proto(PROTO_HDRS PROTO_SRCS ${PROJECT_BINARY_DIR}
@@ -549,6 +733,7 @@ compile_proto(PROTO_HDRS PROTO_SRCS ${PROJECT_BINARY_DIR}
                                     ${PROJECT_SOURCE_DIR}/src
                                     "${PROTO_FILES}")
 add_library(PROTO_LIB OBJECT ${PROTO_SRCS} ${PROTO_HDRS})
+target_link_libraries(PROTO_LIB PRIVATE brpc_common_config)
 
 set(SOURCES
     ${BVAR_SOURCES}

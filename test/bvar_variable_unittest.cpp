@@ -18,15 +18,19 @@
 // Date: Fri Jul 24 17:19:40 CST 2015
 
 #include <pthread.h>                                // pthread_*
-
+#include <unistd.h>                                 // usleep
+#include <sys/utsname.h>                            // uname
+#include <cstring>                                 // strlen
 #include <cstddef>
 #include <memory>
+#include <thread>
 #include <iostream>
 #include <sstream>
 #include "butil/time.h"
 #include "butil/macros.h"
 
 #include "bvar/bvar.h"
+#include "bvar/default_variables.h"                // make_kernel_version_string
 
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
@@ -216,7 +220,7 @@ TEST_F(VariableTest, dump) {
 
     // Nothing to dump yet.
     bvar::FLAGS_bvar_log_dumpped = true;
-    ASSERT_EQ(0, bvar::Variable::dump_exposed(&d, NULL));
+    ASSERT_EQ(0, bvar::Variable::dump_exposed(&d, nullptr));
     ASSERT_TRUE(d._list.empty());
 
     bvar::Adder<int> v2("var2");
@@ -227,9 +231,9 @@ TEST_F(VariableTest, dump) {
     bvar::Adder<int> v4("foo.bar.BaNaNa", "var4");
     v4 << 4;
     bvar::BasicPassiveStatus<int> v5(
-        "foo::bar::Car_Rot", "var5", print_int, NULL);
+        "foo::bar::Car_Rot", "var5", print_int, nullptr);
     
-    ASSERT_EQ(5, bvar::Variable::dump_exposed(&d, NULL));
+    ASSERT_EQ(5, bvar::Variable::dump_exposed(&d, nullptr));
     ASSERT_EQ(5UL, d._list.size());
     int i = 0;
     ASSERT_EQ("foo_bar_apple_var3", d._list[i++ / 2].first);
@@ -324,6 +328,18 @@ TEST_F(VariableTest, latency_recorder) {
     ASSERT_EQ(-1, rec.expose("latency"));
     ASSERT_EQ(-1, rec.expose("Latency"));
 
+    std::string saved_bvar_latency_p1;
+    std::string saved_bvar_latency_p2;
+    std::string saved_bvar_latency_p3;
+
+    GFLAGS_NAMESPACE::GetCommandLineOption("bvar_latency_p1", &saved_bvar_latency_p1);
+    GFLAGS_NAMESPACE::GetCommandLineOption("bvar_latency_p2", &saved_bvar_latency_p2);
+    GFLAGS_NAMESPACE::GetCommandLineOption("bvar_latency_p3", &saved_bvar_latency_p3);
+
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_latency_p1", "80");
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_latency_p2", "90");
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_latency_p3", "99");
+
     
     ASSERT_EQ(0, rec.expose("FooBar__latency"));
     std::vector<std::string> names;
@@ -373,6 +389,10 @@ TEST_F(VariableTest, latency_recorder) {
     ASSERT_EQ("ba_na_na_latency_percentiles", names[8]);
     ASSERT_EQ("ba_na_na_max_latency", names[9]);
     ASSERT_EQ("ba_na_na_qps", names[10]);
+
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_latency_p1", saved_bvar_latency_p1.c_str());
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_latency_p2", saved_bvar_latency_p2.c_str());
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_latency_p3", saved_bvar_latency_p3.c_str());
 }
 
 TEST_F(VariableTest, recursive_mutex) {
@@ -391,6 +411,100 @@ TEST_F(VariableTest, recursive_mutex) {
     timer.stop();
     LOG(INFO) << "Each recursive mutex lock/unlock pair take "
               << timer.n_elapsed() / N << "ns";
+}
+
+struct BlockingDescribeCtx {
+    butil::atomic<bool> entered;
+    butil::atomic<bool> release;
+    BlockingDescribeCtx() : entered(false), release(false) {}
+};
+
+int blocking_getfn(void* arg) {
+    BlockingDescribeCtx* c = static_cast<BlockingDescribeCtx*>(arg);
+    c->entered.store(true);
+    while (!c->release.load()) {
+        usleep(1000);
+    }
+    return 42;
+}
+
+// A Variable dtor must block until all in-flight describe_exposed() finish,
+// otherwise a concurrent describe() would use-after-free the Variable.
+TEST_F(VariableTest, dtor_waits_for_inflight_describe) {
+    BlockingDescribeCtx ctx;
+    auto a = new bvar::PassiveStatus<int>(
+        "lockfree_describe_b", blocking_getfn, &ctx);
+
+    std::thread describer([]{
+        std::ostringstream os;
+        bvar::Variable::describe_exposed("lockfree_describe_b", os);
+    });
+    while (!ctx.entered.load()) {
+        usleep(1000);
+    }
+
+    // Destruct in another thread. It must block inside hide()'s hide_and_wait()
+    // until the in-flight describe finishes.
+    butil::atomic<bool> destructed(false);
+    std::thread destroyer([&]{
+        delete a;
+        destructed.store(true);
+    });
+
+    // While the callback is still blocked, the dtor must not have completed.
+    usleep(200 * 1000);
+    ASSERT_FALSE(destructed.load())
+        << "Variable dtor did not wait for the in-flight describe() to finish.";
+
+    // Release the callback; describe() returns, ref-count drops to 0, and the
+    // dtor is unblocked.
+    ctx.release.store(true);
+    describer.join();
+    destroyer.join();
+
+    ASSERT_TRUE(destructed.load());
+}
+
+TEST_F(VariableTest, kernel_version_contains_uname_fields) {
+    struct utsname buf;
+    ASSERT_EQ(0, uname(&buf));
+
+    // Each field should be non-empty
+    ASSERT_GT(std::strlen(buf.sysname), 0u);
+    ASSERT_GT(std::strlen(buf.nodename), 0u);
+    ASSERT_GT(std::strlen(buf.release), 0u);
+    ASSERT_GT(std::strlen(buf.version), 0u);
+    ASSERT_GT(std::strlen(buf.machine), 0u);
+
+    // Exercise the exact formatter that backs the kernel_version bvar. It is a
+    // header-only helper shared with default_variables.cpp, so this validates
+    // the real production formatting without depending on default_variables.o
+    // being linked into the unit-test binary: that object is stripped via
+    // BVAR_NOT_LINK_DEFAULT_VARIABLES, so the bvar is not registered here and
+    // describe_exposed("kernel_version") would return nothing.
+    const std::string content = bvar::make_kernel_version_string(buf);
+    ASSERT_FALSE(content.empty());
+
+    // The formatted value should contain all the key uname fields.
+    ASSERT_NE(content.find(buf.sysname), std::string::npos);
+    ASSERT_NE(content.find(buf.nodename), std::string::npos);
+    ASSERT_NE(content.find(buf.release), std::string::npos);
+    ASSERT_NE(content.find(buf.version), std::string::npos);
+    ASSERT_NE(content.find(buf.machine), std::string::npos);
+
+    // The trailing newline must be preserved to match the previous
+    // popen("uname -ap") output that this bvar used to expose.
+    ASSERT_EQ('\n', content[content.size() - 1]);
+
+    // On Linux, sysname is "Linux" and the OS suffix is appended; on macOS,
+    // sysname is "Darwin" and there is no OS suffix (both match `uname -ap`).
+#if defined(__linux__)
+    ASSERT_STREQ(buf.sysname, "Linux");
+    ASSERT_NE(content.find("GNU/Linux"), std::string::npos);
+#elif defined(__APPLE__)
+    ASSERT_STREQ(buf.sysname, "Darwin");
+    ASSERT_EQ(content.find("GNU/Linux"), std::string::npos);
+#endif
 }
 } // namespace
 

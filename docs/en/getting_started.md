@@ -108,6 +108,20 @@ Examples link brpc statically, if you need to link the shared version, remove `C
 $ mkdir build && cd build && cmake -DBUILD_UNIT_TESTS=ON .. && make && make test
 ```
 
+### Compile brpc with Bazel
+
+bRPC also supports Bazel builds. The bzlmod example under
+`example/build_with_bazel_module` builds a server and a client against the local
+bRPC checkout:
+
+```shell
+$ cd example/build_with_bazel_module
+$ bazel build //:echo_c++_server //:echo_c++_client
+```
+
+For using bRPC as a Bazel dependency, including the required registries and
+`MODULE.bazel` setup, see [Bazel support](bazel_support.md).
+
 ### Compile brpc with vcpkg
 
 [vcpkg](https://github.com/microsoft/vcpkg) is a package manager that supports all platforms,
@@ -266,7 +280,7 @@ brew install gperftools
 
 If you need to run tests, googletest is required. Run `brew install googletest` first to see if it works. If not (old homebrew does not have googletest), you can download and compile googletest by your own:
 ```shell
-git clone https://github.com/google/googletest -b release-1.10.0 && cd googletest/googletest && mkdir build && cd build && cmake -DCMAKE_CXX_FLAGS="-std=c++11" .. && make
+git clone https://github.com/google/googletest -b release-1.10.0 && cd googletest/googletest && mkdir build && cd build && cmake -DCMAKE_CXX_FLAGS="-std=c++14" .. && make
 ```
 After the compilation, copy `include/` and `lib/` into `/usr/local/include` and `/usr/local/lib` respectively to expose gtest to all apps
 
@@ -276,6 +290,45 @@ openssl installed in Monterey may not be found at `/usr/local/opt/openssl`, inst
 
 * Run `brew link openssl --force` first and check if `/usr/local/opt/openssl` appears.
 * If above command does not work, consider making a soft link using `sudo ln -s /opt/homebrew/Cellar/openssl@3/3.0.3 /usr/local/opt/openssl`. Note that the installed openssl in above command may be put in different places in different environments, which could be revealed by running `brew info openssl`.
+
+### Compile a Debug build with CMake
+
+Apple Silicon can build the Debug configuration against dependencies installed by Homebrew:
+
+```shell
+cmake -S . -B build-debug -G "Unix Makefiles" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DDEBUG=ON \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build build-debug --parallel
+```
+
+The command uses the single-config Unix Makefiles generator, so
+`CMAKE_BUILD_TYPE=Debug` selects CMake's Debug configuration. `DEBUG=ON`
+enables brpc's debug logs and keeps assertions enabled. Build artifacts are
+written to `build-debug/output/`.
+
+To generate a compilation database for tools such as clangd, add the following
+optional argument to the configuration command:
+
+```shell
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+```
+
+The compilation database is generated at `build-debug/compile_commands.json`.
+
+If CMake reports `tapi error: malformed file`, make sure the Command Line Tools
+and Xcode versions match, then select the installed Xcode:
+
+```shell
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+```
+
+If the problem persists, verify that `xcrun --sdk macosx --show-sdk-path` returns
+a valid SDK path.
 
 ### Compile brpc with config_brpc.sh
 git clone brpc, cd into the repo and run
@@ -320,11 +373,11 @@ Same with [here](#compile-brpc-with-cmake)
 
 # Supported deps
 
-## GCC: 4.8-11.2
+## GCC: 5.0-11.2
 
 **Prefer GCC 8.2+**
 
-c++11 is turned on by default to remove dependencies on boost (atomic).
+c++14 is turned on by default to remove dependencies on boost (atomic).
 
 The over-aligned issues in GCC7 is suppressed temporarily now.
 

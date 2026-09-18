@@ -22,6 +22,7 @@
 #include "butil/time.h"
 #include "butil/scoped_lock.h"
 #include "butil/logging.h"
+#include "butil/debug/leak_annotations.h"
 #include "brpc/log.h"
 #include "brpc/protocol.h"
 #include "brpc/input_messenger.h"
@@ -46,6 +47,13 @@ DEFINE_int32(defer_close_second, 0,
              "non-positive values.");
 BRPC_VALIDATE_GFLAG(defer_close_second, PassValidate);
 
+DEFINE_bool(defer_close_respect_idle, false,
+            "When defer_close_second > 0, close a connection immediately when "
+            "the last reference is removed and the socket has already been "
+            "idle for longer than defer_close_second. Disabled by default for "
+            "backward compatibility.");
+BRPC_VALIDATE_GFLAG(defer_close_respect_idle, PassValidate);
+
 DEFINE_bool(show_socketmap_in_vars, false,
             "[DEBUG] Describe SocketMaps in /vars");
 BRPC_VALIDATE_GFLAG(show_socketmap_in_vars, PassValidate);
@@ -54,7 +62,7 @@ DEFINE_bool(reserve_one_idle_socket, false,
             "Reserve one idle socket for pooled connections when idle_timeout_second > 0");
 
 static pthread_once_t g_socket_map_init = PTHREAD_ONCE_INIT;
-static butil::static_atomic<SocketMap*> g_socket_map = BUTIL_STATIC_ATOMIC_INIT(NULL);
+static butil::static_atomic<SocketMap*> g_socket_map = BUTIL_STATIC_ATOMIC_INIT(nullptr);
 
 class GlobalSocketCreator : public SocketCreator {
 public:
@@ -71,6 +79,7 @@ static void CreateClientSideSocketMap() {
     options.socket_creator = new GlobalSocketCreator;
     options.idle_timeout_second_dynamic = &FLAGS_idle_timeout_second;
     options.defer_close_second_dynamic = &FLAGS_defer_close_second;
+    options.defer_close_respect_idle_dynamic = &FLAGS_defer_close_respect_idle;
     if (socket_map->Init(options) != 0) {
         LOG(FATAL) << "Fail to init SocketMap";
         exit(1);
@@ -79,7 +88,7 @@ static void CreateClientSideSocketMap() {
 }
 
 SocketMap* get_client_side_socket_map() {
-    // The consume fence makes sure that we see a NULL or a fully initialized
+    // The consume fence makes sure that we see a nullptr or a fully initialized
     // SocketMap.
     return g_socket_map.load(butil::memory_order_consume);
 }
@@ -90,11 +99,9 @@ SocketMap* get_or_new_client_side_socket_map() {
 }
 
 int SocketMapInsert(const SocketMapKey& key, SocketId* id,
-                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
-                    bool use_rdma,
-                    const HealthCheckOption& hc_option) {
-    return get_or_new_client_side_socket_map()->Insert(key, id, ssl_ctx, use_rdma, hc_option);
-}    
+                    SocketOptions& opt) {
+    return get_or_new_client_side_socket_map()->Insert(key, id, opt);
+}
 
 int SocketMapFind(const SocketMapKey& key, SocketId* id) {
     SocketMap* m = get_client_side_socket_map();
@@ -127,17 +134,18 @@ void SocketMapList(std::vector<SocketId>* ids) {
 // ========== SocketMap impl. ============
 
 SocketMapOptions::SocketMapOptions()
-    : socket_creator(NULL)
+    : socket_creator(nullptr)
     , suggested_map_size(1024)
-    , idle_timeout_second_dynamic(NULL)
+    , idle_timeout_second_dynamic(nullptr)
     , idle_timeout_second(0)
-    , defer_close_second_dynamic(NULL)
-    , defer_close_second(0) {
+    , defer_close_second_dynamic(nullptr)
+    , defer_close_second(0)
+    , defer_close_respect_idle_dynamic(nullptr) {
 }
 
 SocketMap::SocketMap()
     : _exposed_in_bvar(false)
-    , _this_map_bvar(NULL)
+    , _this_map_bvar(nullptr)
     , _has_close_idle_thread(false) {
 }
 
@@ -145,7 +153,7 @@ SocketMap::~SocketMap() {
     RPC_VLOG << "Destroying SocketMap=" << this;
     if (_has_close_idle_thread) {
         bthread_stop(_close_idle_thread);
-        bthread_join(_close_idle_thread, NULL);
+        bthread_join(_close_idle_thread, nullptr);
     }
     if (!_map.empty()) {
         std::ostringstream err;
@@ -168,19 +176,19 @@ SocketMap::~SocketMap() {
     }
 
     delete _this_map_bvar;
-    _this_map_bvar = NULL;
+    _this_map_bvar = nullptr;
 
     delete _options.socket_creator;
-    _options.socket_creator = NULL;
+    _options.socket_creator = nullptr;
 }
 
 int SocketMap::Init(const SocketMapOptions& options) {
-    if (_options.socket_creator != NULL) {
+    if (_options.socket_creator != nullptr) {
         LOG(ERROR) << "Already initialized";
         return -1;
     }
     _options = options;
-    if (_options.socket_creator == NULL) {
+    if (_options.socket_creator == nullptr) {
         LOG(ERROR) << "SocketOptions.socket_creator must be set";
         return -1;
     }
@@ -188,9 +196,11 @@ int SocketMap::Init(const SocketMapOptions& options) {
         LOG(ERROR) << "Fail to init _map";
         return -1;
     }
-    if (_options.idle_timeout_second_dynamic != NULL ||
+    if (_options.idle_timeout_second_dynamic != nullptr ||
         _options.idle_timeout_second > 0) {
-        if (bthread_start_background(&_close_idle_thread, NULL,
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "RunWatchConnections");
+        if (bthread_start_background(&_close_idle_thread, &attr,
                                      RunWatchConnections, this) != 0) {
             LOG(FATAL) << "Fail to start bthread";
             return -1;
@@ -225,9 +235,7 @@ void SocketMap::ShowSocketMapInBvarIfNeed() {
 }
 
 int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
-                      const std::shared_ptr<SocketSSLContext>& ssl_ctx,
-                      bool use_rdma,
-                      const HealthCheckOption& hc_option) {
+                      SocketOptions& opt) {
     ShowSocketMapInBvarIfNeed();
 
     std::unique_lock<butil::Mutex> mu(_mutex);
@@ -244,14 +252,10 @@ int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
         // removing and inserting it again. But this would make error branches
         // below have to remove the entry before returning, which is
         // error-prone. We prefer code maintainability here.
-        sc = NULL;
+        sc = nullptr;
     }
     SocketId tmp_id;
-    SocketOptions opt;
     opt.remote_side = key.peer.addr;
-    opt.initial_ssl_ctx = ssl_ctx;
-    opt.use_rdma = use_rdma;
-    opt.hc_option = hc_option;
     if (_options.socket_creator->CreateSocket(opt, &tmp_id) != 0) {
         PLOG(FATAL) << "Fail to create socket to " << key.peer;
         return -1;
@@ -302,15 +306,29 @@ void SocketMap::RemoveInternal(const SocketMapKey& key,
             *_options.defer_close_second_dynamic
             : _options.defer_close_second;
         if (!remove_orphan && defer_close_second > 0) {
-            // Start count down on this Socket 
-            sc->no_ref_us = butil::cpuwide_time_us();
-        } else {
-            Socket* const s = sc->socket;
-            _map.erase(key);
-            mu.unlock();
-            s->ReleaseAdditionalReference(); // release extra ref
-            ReleaseReference(s);
+            const int64_t now_us = butil::cpuwide_time_us();
+            // NOTE: save the gflag which may be reloaded at any time
+            const bool defer_close_respect_idle = _options.defer_close_respect_idle_dynamic ?
+            *_options.defer_close_respect_idle_dynamic : false;
+            if (!defer_close_respect_idle) {
+                // Start count down on this Socket.
+                sc->no_ref_us = now_us;
+                return;
+            }
+            const int64_t defer_us = (int64_t)defer_close_second * 1000000L;
+            if (sc->no_ref_us <= sc->socket->last_active_time_us() + defer_us) {
+                // When defer_close_respect_idle is enabled, a connection that has
+                // already been idle for longer than defer_close_second is closed
+                // immediately.
+                sc->no_ref_us = now_us;
+                return;
+            }
         }
+        Socket* const s = sc->socket;
+        _map.erase(key);
+        mu.unlock();
+        s->ReleaseAdditionalReference(); // release extra ref
+        ReleaseReference(s);
     }
 }
 
@@ -363,15 +381,23 @@ void SocketMap::ListOrphans(int64_t defer_us, std::vector<SocketMapKey>* out) {
 
 void* SocketMap::RunWatchConnections(void* arg) {
     static_cast<SocketMap*>(arg)->WatchConnections();
-    return NULL;
+    return nullptr;
 }
 
 void SocketMap::WatchConnections() {
+    // This bthread of SocketMap Singleton runs for the whole process lifetime and
+    // never returns, so the local objects below live until the process exits and
+    // their destructors never run. They are reachable from this bthread's  stack,
+    // so the objects themselves are not reported as leaks, but the heap  buffers
+    // they allocate while exposing themselves (variable names, watched path) would
+    // be. Disable leak detection only around their construction and re-enable it
+    // right after
     std::vector<SocketId> main_sockets;
     std::vector<SocketId> pooled_sockets;
     std::vector<SocketMapKey> orphan_sockets;
     const uint64_t CHECK_INTERVAL_US = 1000000UL;
     while (bthread_usleep(CHECK_INTERVAL_US) == 0) {
+        ANNOTATE_SCOPED_MEMORY_LEAK;
         // NOTE: save the gflag which may be reloaded at any time.
         const int idle_seconds = _options.idle_timeout_second_dynamic ?
             *_options.idle_timeout_second_dynamic

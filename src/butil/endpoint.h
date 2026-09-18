@@ -24,6 +24,7 @@
 
 #include <netinet/in.h>                          // in_addr
 #include <sys/un.h>                              // sockaddr_un
+#include <functional>                            // std::function
 #include <iostream>                              // std::ostream
 #include "butil/containers/hash_tables.h"         // hashing functions
 
@@ -60,7 +61,7 @@ struct IPStr {
 // Example: printf("ip=%s\n", ip2str(some_ip).c_str());
 IPStr ip2str(ip_t ip);
 
-// Convert `hostname' to ip_t *ip. If `hostname' is NULL, use hostname
+// Convert `hostname' to ip_t *ip. If `hostname' is nullptr, use hostname
 // of this machine.
 // `hostname' is typically in this form: `tc-cm-et21.tc' `db-cos-dev.db01' ...
 // Returns 0 on success, -1 otherwise.
@@ -127,12 +128,12 @@ int endpoint2hostname(const EndPoint& point, char* hostname, size_t hostname_len
 int endpoint2hostname(const EndPoint& point, std::string* host);
 
 // Create a TCP socket and connect it to `server'. Write port of this side
-// into `self_port' if it's not NULL.
+// into `self_port' if it's not nullptr.
 // Returns the socket descriptor, -1 otherwise and errno is set.
 int tcp_connect(EndPoint server, int* self_port);
 // Suspend caller thread until connect(2) on `sockfd' succeeds
-// or CLOCK_REALTIME reached `abstime' if `abstime' is not NULL.
-// Write port of this side into `self_port' if it's not NULL.
+// or CLOCK_REALTIME reached `abstime' if `abstime' is not nullptr.
+// Write port of this side into `self_port' if it's not nullptr.
 // Returns the socket descriptor, -1 otherwise and errno is set.
 int tcp_connect(const EndPoint& server, int* self_port, int connect_timeout_ms);
 
@@ -141,6 +142,9 @@ int tcp_connect(const EndPoint& server, int* self_port, int connect_timeout_ms);
 // To enable SO_REUSEPORT for the whole program, enable gflag -reuse_port
 // Returns the socket descriptor, -1 otherwise and errno is set.
 int tcp_listen(EndPoint ip_and_port);
+// If `before_listen' is set, it will be called before bind/listen.
+typedef std::function<void(int)> BeforeListenCallback;
+int tcp_listen(EndPoint ip_and_port, BeforeListenCallback before_listen);
 
 // Get the local end of a socket connection
 int get_local_side(int fd, EndPoint *out);
@@ -149,7 +153,7 @@ int get_local_side(int fd, EndPoint *out);
 int get_remote_side(int fd, EndPoint *out);
 
 // Get sockaddr from endpoint, return -1 on failed
-int endpoint2sockaddr(const EndPoint& point, struct sockaddr_storage* ss, socklen_t* size = NULL);
+int endpoint2sockaddr(const EndPoint& point, struct sockaddr_storage* ss, socklen_t* size = nullptr);
 
 // Create endpoint from sockaddr, return -1 on failed
 int sockaddr2endpoint(struct sockaddr_storage* ss, socklen_t size, EndPoint* point);

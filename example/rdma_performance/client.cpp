@@ -71,14 +71,14 @@ static void* GenerateToken(void* arg) {
             accumulative_token += delta;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 class PerformanceTest {
 public:
     PerformanceTest(int attachment_size, bool echo_attachment)
-        : _addr(NULL)
-        , _channel(NULL)
+        : _addr(nullptr)
+        , _channel(nullptr)
         , _start_time(0)
         , _iterations(0)
         , _stop(false)
@@ -102,7 +102,7 @@ public:
 
     int Init() {
         brpc::ChannelOptions options;
-        options.use_rdma = FLAGS_use_rdma;
+        options.socket_mode = FLAGS_use_rdma? brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
         options.protocol = FLAGS_protocol;
         options.connection_type = FLAGS_connection_type;
         options.timeout_ms = FLAGS_rpc_timeout_ms;
@@ -118,7 +118,7 @@ public:
         test::PerfTestRequest request;
         request.set_echo_attachment(_echo_attachment);
         test::PerfTestService_Stub stub(_channel);
-        stub.Test(&cntl, &request, &response, NULL);
+        stub.Test(&cntl, &request, &response, nullptr);
         if (cntl.Failed()) {
             LOG(ERROR) << "RPC call failed: " << cntl.ErrorText();
             return -1;
@@ -167,8 +167,8 @@ public:
         g_total_bytes.fetch_add(closure->cntl->request_attachment().size(), butil::memory_order_relaxed);
         g_total_cnt.fetch_add(1, butil::memory_order_relaxed);
 
-        cntl_guard.reset(NULL);
-        response_guard.reset(NULL);
+        cntl_guard.reset(nullptr);
+        response_guard.reset(nullptr);
 
         if (closure->test->_iterations == 0 && FLAGS_test_iterations > 0) {
             closure->test->_stop = true;
@@ -176,7 +176,7 @@ public:
         }
         --closure->test->_iterations;
         uint64_t last = g_last_time.load(butil::memory_order_relaxed);
-        uint64_t now = butil::gettimeofday_us();
+        uint64_t now = butil::cpuwide_time_us();
         if (now > last && now - last > 100000) {
             if (g_last_time.exchange(now, butil::memory_order_relaxed) == last) {
                 g_client_cpu_recorder << 
@@ -192,14 +192,14 @@ public:
 
     static void* RunTest(void* arg) {
         PerformanceTest* test = (PerformanceTest*)arg;
-        test->_start_time = butil::gettimeofday_us();
+        test->_start_time = butil::cpuwide_time_us();
         test->_iterations = FLAGS_test_iterations;
         
         for (int i = 0; i < FLAGS_queue_depth; ++i) {
             test->SendRequest();
         }
 
-        return NULL;
+        return nullptr;
     }
 
 private:
@@ -215,7 +215,7 @@ private:
 static void* DeleteTest(void* arg) {
     PerformanceTest* test = (PerformanceTest*)arg;
     delete test;
-    return NULL;
+    return nullptr;
 }
 
 void Test(int thread_num, int attachment_size) {
@@ -235,11 +235,11 @@ void Test(int thread_num, int attachment_size) {
         }
         tests.push_back(t);
     }
-    uint64_t start_time = butil::gettimeofday_us();
+    uint64_t start_time = butil::cpuwide_time_us();
     bthread_t tid[thread_num];
     if (FLAGS_expected_qps > 0) {
         bthread_t tid;
-        bthread_start_background(&tid, &BTHREAD_ATTR_NORMAL, GenerateToken, NULL);
+        bthread_start_background(&tid, &BTHREAD_ATTR_NORMAL, GenerateToken, nullptr);
     }
     for (int k = 0; k < thread_num; ++k) {
         bthread_start_background(&tid[k], &BTHREAD_ATTR_NORMAL,
@@ -250,7 +250,7 @@ void Test(int thread_num, int attachment_size) {
             bthread_usleep(10000);
         }
     }
-    uint64_t end_time = butil::gettimeofday_us();
+    uint64_t end_time = butil::cpuwide_time_us();
     double throughput = g_total_bytes / 1.048576 / (end_time - start_time);
     if (FLAGS_test_iterations == 0) {
         std::cout << "Avg-Latency: " << g_latency_recorder.latency(10)

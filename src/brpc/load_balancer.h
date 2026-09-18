@@ -105,6 +105,10 @@ public:
 
 protected:
     virtual ~LoadBalancer() { }
+
+    // Returns true and set `out' if the server is available (not failed, not logoff).
+    // Otherwise, returns false.
+    static bool IsServerAvailable(SocketId id, SocketUniquePtr* out);
 };
 
 DECLARE_bool(show_lb_in_vars);
@@ -182,13 +186,6 @@ private:
 // For registering global instances.
 inline Extension<const LoadBalancer>* LoadBalancerExtension() {
     return Extension<const LoadBalancer>::instance();
-}
-
-inline uint32_t GenRandomStride() {
-    uint32_t prime_offset[] = {
-        #include "bthread/offset_inl.list"
-    };
-    return prime_offset[butil::fast_rand_less_than(ARRAY_SIZE(prime_offset))];
 }
 
 } // namespace brpc

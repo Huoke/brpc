@@ -24,19 +24,30 @@
 #include <sstream>                      // std::ostringstream
 #include <list>                         // std::list
 #include <string>                       // std::string
+#include <vector>                       // std::vector
+#include <memory>                       // std::shared_ptr
 #include "butil/macros.h"               // DISALLOW_COPY_AND_ASSIGN
 #include "butil/strings/string_piece.h" // butil::StringPiece
+#include "bvar/detail/exposed_ref.h"     // detail::ExposedRef
 
 namespace bvar {
 
 class Dumper;
 struct DumpOptions;
 
-class MVariable {
+class MVariableBase {
 public:
-    explicit MVariable(const std::list<std::string>& labels);
+    // Shared, single-use handle that lets describe_exposed()/dump_exposed()
+    // call describe()/dump() OUTSIDE the global MVarMap lock (issue #2888).
+    using SharedExposedRef = detail::SharedExposedRef<MVariableBase>;
 
-    virtual ~MVariable();
+    MVariableBase() = default;
+
+    // mbvar uses bvar, bvar uses TLS, thus copying/assignment need to copy TLS stuff as well,
+    // which is heavy. We disable copying/assignment now.
+    DISALLOW_COPY_AND_ASSIGN(MVariableBase);
+
+    virtual ~MVariableBase();
 
     // Implement this method to print the mvariable info into ostream.
     virtual void describe(std::ostream&) = 0;
@@ -46,12 +57,6 @@ public:
    
     // Get mvariable name
     const std::string& name() const { return _name; }
-    
-    // Get mvariable labels
-    const std::list<std::string>& labels() const { return _labels; }
-
-    // Get number of mvariable labels
-    size_t count_labels() const { return _labels.size(); }
 
     // Expose this mvariable globally so that it's counted in following
     // functions:
@@ -86,7 +91,7 @@ public:
 
     // Find all exposed mvariables matching `white_wildcards' but
     // `black_wildcards' and send them to `dumper'.
-    // Use default options when `options' is NULL.
+    // Use default options when `options' is nullptr.
     // Return number of dumped mvariables, -1 on error.
     static size_t dump_exposed(Dumper* dumper, const DumpOptions* options);
 
@@ -113,11 +118,26 @@ protected:
 
 protected:
     std::string _name;
-    std::list<std::string>  _labels;
+    // Shared indirection handle for describe()/dump() outside the MVarMap lock.
+    SharedExposedRef _ref;
+};
 
-    // mbvar uses bvar, bvar uses TLS, thus copying/assignment need to copy TLS stuff as well,
-    // which is heavy. We disable copying/assignment now. 
-    DISALLOW_COPY_AND_ASSIGN(MVariable);
+template <typename KeyType>
+class MVariable : public MVariableBase {
+public:
+    explicit MVariable(const KeyType& labels) : _labels(labels.cbegin(), labels.cend()) {
+        static_assert(std::is_same<typename KeyType::value_type, std::string>::value,
+                      "value_type of KeyType must be std::string");
+    }
+
+    // Get mvariable labels
+    const KeyType& labels() const { return _labels; }
+
+    // Get number of mvariable labels
+    size_t count_labels() const { return _labels.size(); }
+
+protected:
+    KeyType  _labels;
 };
 
 } // namespace bvar
