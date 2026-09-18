@@ -37,7 +37,7 @@ BUTIL_FORCE_INLINE void ASanPoisonMemoryRegion(const StackStorage& storage) {
     }
 
     CHECK_GT((void*)storage.bottom,
-             reinterpret_cast<void*>(storage.stacksize + + storage.guardsize));
+             reinterpret_cast<void*>(storage.stacksize + storage.guardsize));
     BUTIL_ASAN_POISON_MEMORY_REGION(
         (char*)storage.bottom - storage.stacksize, storage.stacksize);
 }
